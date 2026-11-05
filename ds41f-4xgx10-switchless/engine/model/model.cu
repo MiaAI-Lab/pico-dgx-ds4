@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -43,6 +44,14 @@ __global__ void route_rotate(float* gl, int shift, int group) {
 }
 
 ops::StepSamp samp_of(const Sampling& s) { return ops::StepSamp{s.seed, s.temperature, s.top_p, s.top_k, s.n_top}; }
+
+// night (technique 5): at 9..16 rows the normed GEMVs' prologue (every CTA normalising all rows) made wq_b,
+// wq_a+wkv and the gate run at 50-150 GB/s; one rmsnorm launch, then the plain r16 GEMVs, gives the same bits
+// (test_kernels rows16 checks fused == unfused). DSGB10_FUSED16=1 restores the fused prologues.
+bool unfused16() {
+  static const bool u = !(getenv("DSGB10_FUSED16") && atoi(getenv("DSGB10_FUSED16")));
+  return u;
+}
 
 }  // namespace
 
@@ -542,7 +551,12 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
   float* pck = reinterpret_cast<float*>(pkv + (size_t)R * kKvPart);
   float* pcs = pck + (size_t)R * kCompPart;
   const dsk::Fp8Seg seg[2] = {{w.wqa, w.sqa, pqa, kQaPart}, {w.wkv, w.skv, pkv, kKvPart}};
-  dsk::gemv_fp8_norm(yraw, w.attn_norm, kNormEps, R, seg, 2, kDim, c8k, st, y);
+  if (R > dsk::kLowRows && unfused16()) {  // night: 9..16 rows: norm once, then the plain r16 GEMV (same bits)
+    dsk::rmsnorm(yraw, w.attn_norm, R, kDim, kNormEps, y, yq, ys, st);
+    dsk::gemv_fp8_multi(yq, ys, R, seg, 2, kDim, c8k, st);  // c8k: the fused call's split-K, same bits
+  } else {
+    dsk::gemv_fp8_norm(yraw, w.attn_norm, kNormEps, R, seg, 2, kDim, c8k, st, y);
+  }
   if (dumps) dump(sink, L, "attn_in", pos0, R, y, kDim * 2);
   if (ncomp) {  // this rank's 128 rows of the compressor's wkv (and wgate)
     const attn::CompressorWeights cw{ratio_of(L), U(w.c_wkv), U(w.c_wgate), nullptr, nullptr, nullptr};
@@ -569,7 +583,12 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
                           sb);
   }
   const dsk::Fp8Seg qseg[2] = {{w.wqb, w.sqb, q, kQ}, {w.ix_wqb, w.ix_sqb, iqpre, kIdxQ}};
-  dsk::gemv_fp8_norm(qa, w.q_norm, kNormEps, R, qseg, idx_src(L) ? 2 : 1, kQLora, c8k, st);
+  if (R > dsk::kLowRows && unfused16()) {  // night: wq_b's input normed once (oq/os are free until wo_a)
+    dsk::rmsnorm(qa, w.q_norm, R, kQLora, kNormEps, o, oq, os, st);  // o: scratch for the bf16 copy
+    dsk::gemv_fp8_multi(oq, os, R, qseg, idx_src(L) ? 2 : 1, kQLora, c8k, st);
+  } else {
+    dsk::gemv_fp8_norm(qa, w.q_norm, kNormEps, R, qseg, idx_src(L) ? 2 : 1, kQLora, c8k, st);
+  }
   l2pf(3, L, R);
   join(sb);
   if (idx_src(L)) {
@@ -637,7 +656,12 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
   }
   // ffn_norm + the router's 384 logits in one launch (CTA 0 also quantises the normed input for the
   // experts); the MoE runs the top-6 selection itself
-  dsk::gemv_bf16_norm(yraw, w.ffn_norm, kNormEps, R, w.gate, kExperts, kDim, gl, nullptr, cgate, st, yq, ys);
+  if (R > dsk::kLowRows && unfused16()) {  // night: the gate on the normed rows (y is free after the attention)
+    dsk::rmsnorm(yraw, w.ffn_norm, R, kDim, kNormEps, y, yq, ys, st);
+    dsk::gemv_bf16(y, R, w.gate, kExperts, kDim, gl, nullptr, cgate, false, st);
+  } else {
+    dsk::gemv_bf16_norm(yraw, w.ffn_norm, kNormEps, R, w.gate, kExperts, kDim, gl, nullptr, cgate, st, yq, ys);
+  }
   if (route_shift) route_rotate<<<R, 128, 0, st>>>(gl, route_shift, route_group);  // bench only
   dsk::MoeCfg mc{};
   mc.down = R == 1 ? 2 : 4;
