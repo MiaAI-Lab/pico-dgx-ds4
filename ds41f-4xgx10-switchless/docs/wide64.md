@@ -136,3 +136,23 @@ composition within the wide path. The operator accepted the ulp-level difference
 ### Gates to deploy
 chat c1 >= 78, code c1 >= 134, code16 >= 400 (target) or a clear win at agent load, qeval >= 71 at c4 and
 c16, needle 3/3 at 948K, health 200 and 17*23 = 391 after.
+
+## Increments 5 and 7 and the gate re-fit (05f572f)
+
+- One-pass drafter (`DSGB10_DRAFT1=T`, serve uses 6): a batch step of T or more entries drafts every entry in one
+  pass (`Draft::draft_batch_wide`): wq_b, wo_a and wo_b as prefill GEMMs, the MoE as moe_prefill (repeat picks
+  weighted 0), the FP8 head as one GEMM; wq_a + wkv, the gate and decode_prep keep the 15-row GEMV calls. Drafts are
+  within ~1 ulp of the 3-entry passes; the verified tokens cannot change. Serve, code16: 48-row step GPU time
+  119-120 -> 108-109 ms, code16 352 -> 387 tok/s.
+- Coded-head GEMM (`dsk::gemv_bf16_norm_rows`, on by default, `DSGB10_HEADG=0` turns it off): a wide step's head in
+  one read of the coded weights, bit-exact with the 16-row groups (batch-tf sample hashes identical at 32, 48 and
+  64 rows). Step ms: 32 rows 98.3 -> 97.7, 48 120.1 -> 119.0, 64 139.1 -> 138.2.
+- Gate cost re-fit from serve GPU ms by rows with the one-pass drafter: `DSGB10_WIDE_COST=24,2.2,57,1.1`. code16
+  (two runs each): WIDE=48 382/389, WIDE=56 406/408, WIDE=64 426/433 (old cost model at 64: 421/425, code8 299 vs 335).
+
+Serve results, 16 slots (4 at 1M), BUDGET=1, OEA=4,12,9, DRAFT1=6, WIDE=64, WIDE_COST=24,2.2,57,1.1:
+
+| build | chat c1 | code c1 | code8 | code16 | agent load | qeval c4/c16 | needle 948K |
+|---|---|---|---|---|---|---|---|
+| 4351868 WIDE=48 | 79.3 (9-run med 82.2) | 136.3 (9-run med 139.5) | 295 | 349.7 | 239.5 | 71/71 | 3/3 |
+| 05f572f WIDE=64 | 78.1 (9-run med 79.7) | 133.8 (9-run med 138.4) | 330.4 | 438.4 | 259.9 | 71/71 | 3/3, 9.6k tok/s |
