@@ -73,6 +73,7 @@ struct SpecBatch {
   Sampling sp[ops::kMaxSess];
   SpecCfg cfg;
   int pos_bound = 0;  // launch_verify_batch: the rows' last position at most (the context bucket)
+  int budget = 0;     // night T2/T4: > 0: the next step's rows across the entries, at most (StepIn::rbudget)
 };
 
 // One step, as rank 0 decided it (the golden and bench modes: every rank receives the same).

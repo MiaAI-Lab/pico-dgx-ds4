@@ -73,6 +73,9 @@ struct StepIn {
   int32_t scap[kMaxSess];       // entry k's drafts for the next step, at most (0..kDrafts)
   int32_t spos_end[kMaxSess];   // entry k's rows stay below this position
   float sthresh[kMaxSess];      // entry k's threshold (kGateThresh)
+  // night T2/T4: > 0: the next step's rows in all, at most (the entries' caps may sum past it); the gate then
+  // keeps the drafts with the highest survival across the entries (lossless: only which drafts are verified)
+  int32_t rbudget;
 };
 static_assert(sizeof(StepIn) % 4 == 0, "StepIn is copied word by word");
 // slot = *counter % kInSlots of ring -> dev, feedback tokens resolved from fb, ++*counter.

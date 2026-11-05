@@ -166,27 +166,55 @@ __global__ void k_spec_in_batch(const ops::StepIn* ring, uint32_t* counter, cons
 __global__ void k_spec_gate_batch_all(const ops::StepIn* in, ops::SpecState* ss, const int* tok0, int tok_stride,
                                       const float* surv0, int surv_stride, ops::SampleOut* outs) {
   const int k = threadIdx.x;
-  if (k >= ops::kMaxSess || k >= in->nsess || !in->sess_on[k]) return;
+  __shared__ int sn[ops::kMaxSess];
+  __shared__ float ssv[ops::kMaxSess][ops::kDrafts];
+  const bool on = k < ops::kMaxSess && k < in->nsess && in->sess_on[k];
+  int n = 0;
+  if (on) {
+    const float* surv = surv0 + k * surv_stride;
+    const ops::SpecState& s = ss[k];
+    const int P = s.pos0 + s.count;
+    const int maxk = min(min(ops::kDrafts, in->scap[k]), in->spos_end[k] - 1 - P);
+    const float thresh = in->sthresh[k];
+    if (in->gate == ops::kGateRatio) {
+      float e = 1.f, best = 1.f / in->step_ms[0];
+      for (int j = 1; j <= maxk; ++j) {
+        e += surv[j - 1];
+        const float r = e / in->step_ms[j];
+        if (r > best) best = r, n = j;
+      }
+    } else if (in->gate == ops::kGateMarginal) {
+      while (n < maxk && surv[n] >= thresh * (in->step_ms[n + 1] - in->step_ms[n])) ++n;
+    } else {
+      while (n < maxk && surv[n] >= thresh) ++n;
+    }
+    for (int j = 0; j < ops::kDrafts; ++j) ssv[k][j] = surv[j];
+  }
+  if (k < ops::kMaxSess) sn[k] = on ? n : -1;
+  __syncthreads();
+  // night T2/T4: a row budget across the entries: while the rows exceed it, drop the draft with the least
+  // survival among the entries' last kept drafts (survival falls along a session's drafts, so this keeps the
+  // drafts with the most expected tokens). Ties: the higher entry. Every rank computes the same.
+  if (k == 0 && in->rbudget > 0) {
+    int rows = 0;
+    for (int q = 0; q < ops::kMaxSess && q < in->nsess; ++q)
+      if (sn[q] >= 0) rows += 1 + sn[q];
+    while (rows > in->rbudget) {
+      int bq = -1;
+      float bv = 2.f;
+      for (int q = 0; q < ops::kMaxSess && q < in->nsess; ++q)
+        if (sn[q] > 0 && ssv[q][sn[q] - 1] <= bv) bv = ssv[q][sn[q] - 1], bq = q;
+      if (bq < 0) break;
+      --sn[bq], --rows;
+    }
+  }
+  __syncthreads();
+  if (!on) return;
+  n = sn[k];
   const int* drafts = tok0 + k * tok_stride;
-  const float* surv = surv0 + k * surv_stride;
   ops::SampleOut& o = outs[in->step % ops::kOutSlots];
   ops::SpecState& s = ss[k];
   const int P = s.pos0 + s.count;
-  const int maxk = min(min(ops::kDrafts, in->scap[k]), in->spos_end[k] - 1 - P);
-  const float thresh = in->sthresh[k];
-  int n = 0;
-  if (in->gate == ops::kGateRatio) {
-    float e = 1.f, best = 1.f / in->step_ms[0];
-    for (int j = 1; j <= maxk; ++j) {
-      e += surv[j - 1];
-      const float r = e / in->step_ms[j];
-      if (r > best) best = r, n = j;
-    }
-  } else if (in->gate == ops::kGateMarginal) {
-    while (n < maxk && surv[n] >= thresh * (in->step_ms[n + 1] - in->step_ms[n])) ++n;
-  } else {
-    while (n < maxk && surv[n] >= thresh) ++n;
-  }
   s.next_rows = 1 + n;
   s.next_pos0 = P;
   s.next_tok[0] = s.bonus;
@@ -1027,6 +1055,7 @@ void Model::Impl::spec_fill_batch(ops::StepIn& in, int mode, const SpecBatch& b)
     in.spos_end[k] = has ? std::min(b.pos_end[k], slot_ctx_[b.slot[k]]) : 0;
     in.sthresh[k] = has ? b.thresh[k] : 0.f;
   }
+  in.rbudget = b.budget > 0 ? std::min(b.budget, kMaxRows) : 0;
 }
 
 // The checks a batch spec step needs (every rank passes the same): the entries on, each in a slot of its
@@ -1049,7 +1078,9 @@ int Model::Impl::spec_batch_check(const SpecBatch& b, bool given) {
       die("model: batch spec entry %d: token %d at %d", k, b.token[k], b.pos0[k]);
   }
   if (S < 1) die("model: a batch spec step with no entry on");
-  if (rows > kMaxRows) die("model: a batch spec step of %d entries whose next rows could reach %d (kMaxRows %d)", S, rows, kMaxRows);
+  if (b.budget > 0 ? S > std::min(b.budget, kMaxRows) : rows > kMaxRows)
+    die("model: a batch spec step of %d entries whose next rows could reach %d (kMaxRows %d, budget %d)", S, rows, kMaxRows,
+        b.budget);
   return S;
 }
 
