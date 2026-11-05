@@ -1,3 +1,14 @@
+# dsgx10-wide
+
+Fork of [blaesus/dsgx10](https://github.com/blaesus/dsgx10) by Andy Shu (MIT). Changes by Patrick Moorhead.
+
+Based on upstream `a92b8f4`. Adds 1M context, 16 concurrent slots and multi-user decode changes to
+`ds41f-4xgx10-switchless` (DeepSeek-V4.1-Flash / V4.1-Flash-1017 on four GB10 boxes, TP=4). See
+[CHANGES.md](CHANGES.md) for each change and its measured effect. The engine, kernels, RoCE ring and
+drafter are upstream's work; the upstream LICENSE and NOTICE are kept as they were.
+
+---
+
 # dsgx10
 
 From-scratch inference engines for NVIDIA GB10 boxes.
