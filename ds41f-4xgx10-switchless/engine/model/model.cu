@@ -718,7 +718,18 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
   }
   if (route_shift) route_rotate<<<R, 128, 0, st>>>(gl, route_shift, route_group);  // bench only
   if (wide) {
-    dsk::router_topk(gl, w.gate_bias, R, kExperts, ridx, rwts, kRouteScale, st);
+    // wide64: DSGB10_WIDE_OEA=K0,KP (default: DSGB10_OEA's K0,KP when that is set) re-routes the wide step's rows
+    // toward the batch's core experts (lossy, as DSGB10_OEA in moe_routed)
+    static const std::pair<int, int> oea = [] {
+      int k0 = 0, kp = 0, mr = 0;
+      if (const char* e = getenv("DSGB10_WIDE_OEA")) std::sscanf(e, "%d,%d", &k0, &kp);
+      else if (const char* e2 = getenv("DSGB10_OEA")) std::sscanf(e2, "%d,%d,%d", &k0, &kp, &mr);
+      return std::make_pair(k0, kp);
+    }();
+    if (oea.first > 0)
+      dsk::router_topk_oea(gl, w.gate_bias, R, kExperts, ridx, rwts, kRouteScale, oea.first, oea.second, st);
+    else
+      dsk::router_topk(gl, w.gate_bias, R, kExperts, ridx, rwts, kRouteScale, st);
     dsk::moe_prefill(yq, ys, R, ridx, rwts, kExperts, w.moe, moe_pws, ymoe, st);
   } else {
     dsk::MoeCfg mc{};

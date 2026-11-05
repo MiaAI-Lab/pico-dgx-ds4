@@ -170,6 +170,10 @@ void rmsnorm(const __nv_bfloat16* x, const __nv_bfloat16* w, int M, int D, float
 // scores + bias (descending), weights = scores / (sum + 1e-20) * route_scale.
 void router_topk(const float* logits, const float* bias, int M, int E, int* idx, float* wts, float route_scale,
                  cudaStream_t st);
+// wide64: the same with batch-aware re-routing (moe_routed's DSGB10_OEA): every row keeps its top k0, its other
+// picks prefer the step's core (the union of every row's top k0) among its top kp. One CTA. Lossy.
+void router_topk_oea(const float* logits, const float* bias, int M, int E, int* idx, float* wts, float route_scale, int k0,
+                     int kp, cudaStream_t st);
 
 // ---- MoE (routed MXFP4 experts + FP8 shared expert), per rank at TP=4: dim 5120, 576 intermediate
 
