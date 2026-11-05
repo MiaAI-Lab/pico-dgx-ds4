@@ -219,6 +219,48 @@ __global__ void k_spec_gate_batch_all(const ops::StepIn* in, ops::SpecState* ss,
       if (bq < 0) break;
       --sn[bq], --rows;
     }
+    // wide64 (docs/wide64.md): past kDecodeRows rows the gate picks by expected tokens per ms (in->wcost's step
+    // model, by the bucket's rows). It trims the lowest-survival last drafts one at a time (drafts below wsmin go
+    // first, unconditionally) and keeps the best point of that order from the full step down to kDecodeRows rows,
+    // so a step goes wide only when its drafts pay for the wide body. Lossless: only which drafts are verified.
+    if (in->rbudget > kDecodeRows && rows > kDecodeRows) {
+      auto cost = [&](int R) {
+        return R <= kDecodeRows ? in->wcost[0] + in->wcost[1] * R
+                                : in->wcost[2] + in->wcost[3] * ops::spec_body_rows(R);
+      };
+      auto low = [&](float* v) {  // the entry whose last kept draft has the least survival (ties: the higher entry)
+        int bq = -1;
+        float bv = 2.f;
+        for (int q = 0; q < ops::kMaxSess && q < in->nsess; ++q)
+          if (sn[q] > 0 && ssv[q][sn[q] - 1] <= bv) bv = ssv[q][sn[q] - 1], bq = q;
+        *v = bv;
+        return bq;
+      };
+      float etok = 0.f;  // expected tokens: each entry's bonus, plus the survival of every kept draft
+      for (int q = 0; q < ops::kMaxSess && q < in->nsess; ++q)
+        if (sn[q] >= 0) {
+          etok += 1.f;
+          for (int j = 0; j < sn[q]; ++j) etok += ssv[q][j];
+        }
+      for (float v; rows > kDecodeRows;) {  // drafts below wsmin never take a row past 16
+        const int q = low(&v);
+        if (q < 0 || v >= in->wsmin) break;
+        --sn[q], --rows, etok -= v;
+      }
+      int keep[ops::kMaxSess];
+      for (int q = 0; q < ops::kMaxSess; ++q) keep[q] = sn[q];
+      float best = etok / cost(rows);
+      for (float v; rows > kDecodeRows;) {
+        const int q = low(&v);
+        if (q < 0) break;
+        --sn[q], --rows, etok -= v;
+        if (etok / cost(rows) > best) {
+          best = etok / cost(rows);
+          for (int k2 = 0; k2 < ops::kMaxSess; ++k2) keep[k2] = sn[k2];
+        }
+      }
+      for (int q = 0; q < ops::kMaxSess; ++q) sn[q] = keep[q];
+    }
   }
   __syncthreads();
   if (!on) return;
@@ -1073,6 +1115,14 @@ void Model::Impl::spec_fill_batch(ops::StepIn& in, int mode, const SpecBatch& b)
     in.sthresh[k] = has ? b.thresh[k] : 0.f;
   }
   in.rbudget = b.budget > 0 ? std::min(b.budget, spec_row_cap()) : 0;
+  static const float wsmin = getenv("DSGB10_WIDE_SMIN") ? (float)atof(getenv("DSGB10_WIDE_SMIN")) : 0.f;
+  in.wsmin = wsmin;
+  static const std::array<float, 4> wc = [] {
+    std::array<float, 4> c{26.f, 2.1f, 56.f, 1.6f};
+    if (const char* e = getenv("DSGB10_WIDE_COST")) std::sscanf(e, "%f,%f,%f,%f", &c[0], &c[1], &c[2], &c[3]);
+    return c;
+  }();
+  for (int i = 0; i < 4; ++i) in.wcost[i] = wc[i];
 }
 
 // The checks a batch spec step needs (every rank passes the same): the entries on, each in a slot of its

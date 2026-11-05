@@ -76,6 +76,12 @@ struct StepIn {
   // night T2/T4: > 0: the next step's rows in all, at most (the entries' caps may sum past it); the gate then
   // keeps the drafts with the highest survival across the entries (lossless: only which drafts are verified)
   int32_t rbudget;
+  // wide64: with rbudget > kDecodeRows, rows past kDecodeRows keep only drafts whose survival is at least this
+  // (DSGB10_WIDE_SMIN; a row past 16 costs ~2.4 ms against ~3.7 ms a row at 16, so a draft must pay for it)
+  float wsmin;
+  // wide64: the gate's step-cost model (ms) by the rows R a step runs: R <= kDecodeRows: wcost[0] + wcost[1] R; a
+  // wide bucket of Rb rows: wcost[2] + wcost[3] Rb (DSGB10_WIDE_COST; fit to serve's GPU ms by rows, 2026-11-05: 26, 2.1, 56, 1.6)
+  float wcost[4];
 };
 static_assert(sizeof(StepIn) % 4 == 0, "StepIn is copied word by word");
 // slot = *counter % kInSlots of ring -> dev, feedback tokens resolved from fb, ++*counter.
