@@ -1,6 +1,8 @@
 # wide64: a drafted batch step of up to 64 rows
 
-Status: design, increment 1 (bench model) and increment 2 (wide `launch_batch` body, 4-rank verified) on branch `wide64`. Production stays on
+Status: increments 1-3 + OEA on the wide MoE built on branch `wide64` and DEPLOYED 2026-11-05 17:00 UTC (4351868,
+`DSGB10_WIDE=48`): code16 296 -> 350, agent 215 -> 240, c1 unchanged, qeval 71/71, needle 3/3.
+Original status line: design, increment 1 (bench model) and increment 2 (wide `launch_batch` body, 4-rank verified) on branch `wide64`. Production stays on
 cb61118 + `DSGB10_BUDGET=1 DSGB10_OEA=4,12,9` until a wide build passes every gate.
 
 ## Why
