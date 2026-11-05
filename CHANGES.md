@@ -1,4 +1,4 @@
-# Changes in this fork
+# Changes in pico-dgx-ds4
 
 Fork of blaesus/dsgx10 by Andy Shu (MIT). Changes by Patrick Moorhead.
 Base: upstream `a92b8f4` (master, 2026-10-18). All changes are in `ds41f-4xgx10-switchless/`.

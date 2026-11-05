@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="assets/banner.svg" alt="dsgx10-wide: DeepSeek V4.1 Flash on 4x DGX Spark" width="100%">
+  <img src="assets/banner.png" alt="pico-dgx-ds4: DeepSeek V4.1 Flash on 4x DGX Spark" width="100%">
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/model-DeepSeek%20V4.1%20Flash%201017-ff79c6?style=flat-square&labelColor=1a1420">
-  <img src="https://img.shields.io/badge/hardware-4x%20DGX%20Spark%20(GB10)-ffb3d9?style=flat-square&labelColor=1a1420">
-  <img src="https://img.shields.io/badge/context-1M-c9a0ff?style=flat-square&labelColor=1a1420">
-  <img src="https://img.shields.io/badge/license-MIT-a58aa8?style=flat-square&labelColor=1a1420">
+  <img src="https://img.shields.io/badge/model-DeepSeek%20V4.1%20Flash%201017-ffffff?style=flat-square&labelColor=000000">
+  <img src="https://img.shields.io/badge/hardware-4x%20DGX%20Spark%20(GB10)-bbbbbb?style=flat-square&labelColor=000000">
+  <img src="https://img.shields.io/badge/context-1M-bbbbbb?style=flat-square&labelColor=000000">
+  <img src="https://img.shields.io/badge/license-MIT-bbbbbb?style=flat-square&labelColor=000000">
 </p>
 
 ```
@@ -21,12 +21,12 @@
 
 ## ✧ the numbers
 
-<p align="center"><img src="assets/c16.svg" alt="16-user throughput" width="80%"></p>
-<p align="center"><img src="assets/c1.svg" alt="single-user throughput" width="80%"></p>
+<p align="center"><img src="assets/c16.png" alt="16-user throughput" width="80%"></p>
+<p align="center"><img src="assets/c1.png" alt="single-user throughput" width="80%"></p>
 
 ```
 ┌──────────────────────────┬──────────────┬──────────────┬────────────┐
-│ metric                   │ upstream     │ dsgx10-wide  │ sglang tp4 │
+│ metric                   │ upstream     │ pico-dgx-ds4 │ sglang tp4 │
 ├──────────────────────────┼──────────────┼──────────────┼────────────┤
 │ chat, 1 user             │ 80           │ 80           │ 64         │
 │ code, 1 user             │ 140          │ 138          │ 117        │
@@ -73,7 +73,7 @@ The full 4-Spark setup (switch, kernel, weights, serve, benchmarks) is in its co
 
 ```
   engine, kernels, RoCE ring, drafter ...... Andy Shu, blaesus/dsgx10 (MIT)  ♡ thank you
-  multi-user, 1M context, wide step ........ Patrick Moorhead (this fork)
+  multi-user, 1M context, wide step ........ Pico (Patrick Moorhead), this fork
 ```
 
 The upstream LICENSE and NOTICE are unchanged and cover this fork. Upstream's README follows.
@@ -194,3 +194,5 @@ third-party material is listed in [NOTICE](NOTICE). No model weights are include
 ```
  .~~~~~~.  .~~~~~~.  .~~~~~~.  .~~~~~~.     ⭐ star  ·  ♡ follow @Picom-code  ·  (｡•̀ᴗ-)✧
 ```
+
+<p align="right"><i>— Pico</i></p>

@@ -29,7 +29,7 @@ with its licence:
 
 No model weights are included.
 
-## This fork (dsgx10-wide)
+## This fork (pico-dgx-ds4)
 
 Fork of blaesus/dsgx10 by Andy Shu (MIT). Changes by Patrick Moorhead.
 The upstream LICENSE is unchanged and covers the changes too. The changes are listed in CHANGES.md.
