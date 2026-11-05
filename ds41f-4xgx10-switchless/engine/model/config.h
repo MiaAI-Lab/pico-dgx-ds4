@@ -18,13 +18,21 @@ constexpr int kVocabPart = kVocab / kRanks;  // 32320 head rows per rank
 // step buffers, the StepIn / SampleOut rings, the sampler's grid and the graphs are sized by it; a graph is
 // captured on first use, so unused row counts cost nothing.
 constexpr int kMaxRows = 16;
-constexpr int kMaxSlots = 8;                // session slots (Options::slots): live sessions' states, at most
+constexpr int kMaxSlots = 16;               // session slots (Options::slots): live sessions' states, at most
 // Rows of one session in a step, at most, whatever kMaxRows is: the attention kernels' contract for a
 // step's slot table. attn::decode_prep's fused compressor emit and carry race across CTAs at 16 rows of
 // one session (the step runs kv_write and compressor_emit, safe at 16, but the contract holds for any
 // caller), and attn can check only steps without a table: the model checks every step it builds
 // (next_in, launch_batch). The one-session spec graph's switch has this many bodies.
 constexpr int kMaxSessRows = 8;
+// Entries a drafted batch step (B3) takes at most, whatever the slots: its graph's if nodes and memory grow
+// with them, and past 8 sessions a step of kMaxRows rows leaves no room for a draft each.
+constexpr int kMaxSpecEnts = 8;
+// Physical session units (Options::big_slots): a slot of the full context is kUnitMul units of the small
+// slots' size laid end to end, so every kernel's slot * stride addressing stays uniform (a slot table holds
+// units, the server's slots stay logical: cancel bits, Cmd::live).
+constexpr int kMaxUnits = 64;
+constexpr int kUnitMul = 8;
 
 // attention, per rank
 constexpr int kQLora = 1280, kQaPart = kQLora / kRanks;  // wq_a: 320 rows per rank

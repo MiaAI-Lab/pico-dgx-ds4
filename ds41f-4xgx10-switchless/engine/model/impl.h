@@ -3,6 +3,7 @@
 // (DSpark: the draft module and the speculative steps).
 #pragma once
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -94,6 +95,15 @@ struct KvSrc {  // a kv-source layer's compressed KV, index keys and compressor 
 };
 constexpr size_t kRingKvBytes = (size_t)attn::kRing * kHead, kRingScBytes = (size_t)attn::kRing * kHead / 32;
 
+// DIAGNOSTICS (model.cu k_route_copy): a step's routed experts
+constexpr int kRouteRing = 8;
+struct RouteRec {
+  uint32_t step;
+  int32_t R;
+  int32_t slot[kMaxRows], pos[kMaxRows];
+  int16_t e[kLayers][kMaxRows][kTopK];
+};
+
 struct Prefill;  // prefill.cu's buffers
 struct Store;    // state.cu's sessions
 struct Spec;     // spec.cu's draft module and spec steps
@@ -123,7 +133,9 @@ struct Model::Impl {
   detail::KvSrc kvs[kKvSlots];
   uint8_t *ring_kv0[kLayers], *ring_sc0[kLayers];
   detail::KvSrc kvs0[kKvSlots];
-  int nslots = 1, cur_slot = 0;
+  int nslots = 1, cur_slot = 0;  // logical slots (the server's), the current one
+  int nunits = 1, cur_unit = 0;  // physical units (config.h kUnitMul): what slot tables and strides index
+  int unit_of[kMaxSlots] = {}, slot_ctx_[kMaxSlots] = {};
   float2 *rope_plain, *rope_yarn;
   int kstride;
 
@@ -171,8 +183,8 @@ struct Model::Impl {
   const engram::HashMap* emap = nullptr;
   engram::Store* store = nullptr;
   std::vector<int32_t> hist;  // token ids of the sequence so far (hashing reads 3 back): the current slot's
-  std::vector<int32_t> hists[kMaxSlots];  // the other slots' (use_slot swaps them in and out)
-  std::vector<int32_t>& hist_of(int s) { return s == cur_slot ? hist : hists[s]; }
+  std::vector<int32_t> hists[kMaxUnits];  // the other slots' by unit (use_slot swaps them in and out)
+  std::vector<int32_t>& hist_of(int u) { return u == cur_unit ? hist : hists[u]; }
   std::vector<uint32_t> ids;  // [R][2][24]
   uint8_t* e_send[2];         // pinned: this rank's packed records per Engram layer
   uint32_t* e_off[2];         // pinned: [R][24] offsets into the gathered segments
@@ -188,6 +200,9 @@ struct Model::Impl {
     uint64_t seq[2] = {};
     int32_t pos[kMaxRows] = {}, slot[kMaxRows] = {};
   } late;
+
+  detail::RouteRec* route_ring = nullptr;  // DSGB10_ROUTE_DUMP
+  FILE* route_f = nullptr;
 
   // re-laying weights the file holds in their natural layout (freed after bind)
   uint8_t* scratch = nullptr;

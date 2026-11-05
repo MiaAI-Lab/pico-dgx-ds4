@@ -22,6 +22,18 @@ namespace {
 
 // Bench only (Model::set_route_shift): row blockIdx.x's router logits [kExperts] rotated by
 // shift * (row / group).
+// DIAGNOSTICS (DSGB10_ROUTE_DUMP=FILE, rank 0): layer L's routed experts of every row into a ring by step,
+// with the step's rows, slots and positions; the host appends each finished step to FILE (wait()).
+__global__ void k_route_copy(const int* ridx, const ops::StepIn* in, int L, RouteRec* ring) {
+  RouteRec& rr = ring[in->step % kRouteRing];
+  const int R = in->rows < kMaxRows ? in->rows : kMaxRows;
+  for (int i = threadIdx.x; i < R * kTopK; i += blockDim.x) rr.e[L][i / kTopK][i % kTopK] = (int16_t)ridx[i];
+  if (L == 0 && threadIdx.x < kMaxRows) {
+    rr.slot[threadIdx.x] = in->slot[threadIdx.x], rr.pos[threadIdx.x] = in->pos[threadIdx.x];
+    if (threadIdx.x == 0) rr.R = R, rr.step = in->step;
+  }
+}
+
 __global__ void route_rotate(float* gl, int shift, int group) {
   __shared__ float s[kExperts];
   float* g = gl + (size_t)blockIdx.x * kExperts;
@@ -52,22 +64,42 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
   const int R = kMaxRows;
   if (opt.slots < 1 || opt.slots > kMaxSlots) die("model: %d session slots (1..%d)", opt.slots, kMaxSlots);
   nslots = opt.slots;
-  // per-layer window rings, and the kv sources' caches, keys and carries: one of each per session slot
+  // big slots (Options::big_slots): kUnitMul units each, the small ones one unit of max_ctx / kUnitMul
+  const int nbig = opt.big_slots > 0 && opt.big_slots < nslots ? opt.big_slots : nslots;
+  const int mul = nbig < nslots ? kUnitMul : 1;
+  if (mul > 1 && opt.max_ctx % (2 * kUnitMul)) die("model: --max-ctx %d with big slots: a multiple of %d", opt.max_ctx, 2 * kUnitMul);
+  const int unit_ctx = opt.max_ctx / mul;
+  nunits = 0;
+  for (int s = 0; s < nslots; ++s) {
+    unit_of[s] = nunits;
+    slot_ctx_[s] = s < nbig ? opt.max_ctx : unit_ctx;
+    nunits += s < nbig ? mul : 1;
+  }
+  if (nunits > kMaxUnits) die("model: %d session units (at most %d)", nunits, kMaxUnits);
+  // per-layer window rings, and the kv sources' caches, keys and carries: one of each per unit
   for (int L = 0; L < kLayers; ++L) {
-    ring_kv0[L] = dalloc<uint8_t>(nslots * kRingKvBytes);
-    ring_sc0[L] = dalloc<uint8_t>(nslots * kRingScBytes);
+    ring_kv0[L] = dalloc<uint8_t>(nunits * kRingKvBytes);
+    ring_sc0[L] = dalloc<uint8_t>(nunits * kRingScBytes);
   }
   for (int L : {2, 8, 14, 20}) {
     KvSrc& k = kvs0[kv_slot(L)];
-    k.cap = opt.max_ctx / ratio_of(L) + 64;
-    k.ckv = dalloc<uint8_t>(nslots * k.ckv_stride());
-    k.csc = dalloc<uint8_t>(nslots * k.csc_stride());
-    k.ik = dalloc<uint8_t>(nslots * k.ik_stride());
-    k.iksc = dalloc<uint8_t>(nslots * k.iksc_stride());
-    k.carry_kv = dalloc<float>(nslots * KvSrc::kCarryStride);
-    k.carry_sc = dalloc<float>(nslots * KvSrc::kCarryStride);
+    k.cap = unit_ctx / ratio_of(L) + 64;  // a big slot: kUnitMul of these end to end (>= max_ctx / ratio + 64)
+    k.ckv = dalloc<uint8_t>(nunits * k.ckv_stride());
+    k.csc = dalloc<uint8_t>(nunits * k.csc_stride());
+    k.ik = dalloc<uint8_t>(nunits * k.ik_stride());
+    k.iksc = dalloc<uint8_t>(nunits * k.iksc_stride());
+    k.carry_kv = dalloc<float>(nunits * KvSrc::kCarryStride);
+    k.carry_sc = dalloc<float>(nunits * KvSrc::kCarryStride);
   }
+  if (rank == 0 && nunits != nslots)
+    std::printf("model: %d session slots, %d of %d positions and %d of %d (%d units)\n", nslots, nbig, opt.max_ctx,
+                nslots - nbig, unit_ctx, nunits);
   use_slot(0);
+  if (const char* rd = getenv("DSGB10_ROUTE_DUMP"); rd && rank == 0) {
+    route_ring = dalloc<RouteRec>(kRouteRing);
+    route_f = fopen(rd, "wb");
+    if (!route_f) die("model: DSGB10_ROUTE_DUMP %s", rd);
+  }
   rope_plain = dalloc<float2>((size_t)opt.max_ctx * 32);
   rope_yarn = dalloc<float2>((size_t)opt.max_ctx * 32);
   attn::rope_table_build(rope_plain, opt.max_ctx, false, st);
@@ -380,34 +412,35 @@ size_t Model::Impl::code_head(int* raw_tiles) {
 
 void Model::Impl::use_slot(int s) {
   if (s < 0 || s >= nslots) die("model: slot %d of %d", s, nslots);
-  if (s != cur_slot) hist.swap(hists[cur_slot]), hist.swap(hists[s]);  // Engram's history: slot s's
-  cur_slot = s;
-  for (int L = 0; L < kLayers; ++L) ring_kv[L] = ring_kv0[L] + s * kRingKvBytes, ring_sc[L] = ring_sc0[L] + s * kRingScBytes;
-  for (int k = 0; k < kKvSlots; ++k) kvs[k] = kvs0[k].at(s);
-  spec_use_slot(s);  // the draft module's windows, once bound
+  const int u = unit_of[s];
+  if (u != cur_unit) hist.swap(hists[cur_unit]), hist.swap(hists[u]);  // Engram's history: slot s's
+  cur_slot = s, cur_unit = u;
+  for (int L = 0; L < kLayers; ++L) ring_kv[L] = ring_kv0[L] + u * kRingKvBytes, ring_sc[L] = ring_sc0[L] + u * kRingScBytes;
+  for (int k = 0; k < kKvSlots; ++k) kvs[k] = kvs0[k].at(u);
+  spec_use_slot(u);  // the draft module's windows, once bound
 }
 
 attn::Window Model::Impl::step_win(int L) const {
   attn::Window w{ring_kv0[L], ring_sc0[L]};
-  if (nslots > 1) w.slot = in_d->slot, w.kv_stride = kRingKvBytes, w.sc_stride = kRingScBytes;
+  if (nunits > 1) w.slot = in_d->slot, w.kv_stride = kRingKvBytes, w.sc_stride = kRingScBytes;
   return w;
 }
 
 attn::Compressed Model::Impl::step_ckv(int k) const {
   attn::Compressed c = kvs0[k].compressed();
-  if (nslots > 1) c.slot = in_d->slot, c.kv_stride = kvs0[k].ckv_stride(), c.sc_stride = kvs0[k].csc_stride();
+  if (nunits > 1) c.slot = in_d->slot, c.kv_stride = kvs0[k].ckv_stride(), c.sc_stride = kvs0[k].csc_stride();
   return c;
 }
 
 attn::IndexKeys Model::Impl::step_keys(int k) const {
   attn::IndexKeys ik = kvs0[k].keys();
-  if (nslots > 1) ik.slot = in_d->slot, ik.k_stride = kvs0[k].ik_stride(), ik.sc_stride = kvs0[k].iksc_stride();
+  if (nunits > 1) ik.slot = in_d->slot, ik.k_stride = kvs0[k].ik_stride(), ik.sc_stride = kvs0[k].iksc_stride();
   return ik;
 }
 
 attn::CompressorCarry Model::Impl::step_carry(int k) const {
   attn::CompressorCarry c{kvs0[k].carry_kv, kvs0[k].carry_sc};
-  if (nslots > 1) c.slot = in_d->slot, c.stride = KvSrc::kCarryStride;
+  if (nunits > 1) c.slot = in_d->slot, c.stride = KvSrc::kCarryStride;
   return c;
 }
 
@@ -609,6 +642,7 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
   dsk::MoeCfg mc{};
   mc.down = R == 1 ? 2 : 4;
   dsk::moe_routed(yq, ys, R, gl, w.gate_bias, kExperts, kRouteScale, w.moe, moe_ws, ymoe, mc, st, ridx, rwts);
+  if (route_ring) k_route_copy<<<1, 128, 0, st>>>(ridx, in_d, L, route_ring);
   l2pf(1, L + 1, R);
   join(sa);  // the mixes
   // the experts' partial sums all-reduced, hc_post into the next block's input, and its collapse
@@ -636,7 +670,7 @@ ops::StepIn& Model::Impl::next_in(uint64_t n, int R, int pos0, const int32_t* to
     in.tokens[r] = r < R ? tokens[r] : 0;
     const int d = R - 1 - std::min(r, R - 1);  // rows after this one (bench: set_pos_stride)
     in.pos[r] = pos0 + R - 1 - d / pos_group * pos_stride - d % pos_group;
-    in.slot[r] = cur_slot;
+    in.slot[r] = cur_unit;
     in.sess[r] = 0;
   }
   for (ops::StepSamp& s : in.samp) s = samp_of(sp);
@@ -650,7 +684,7 @@ ops::StepIn& Model::Impl::next_in(uint64_t n, int R, int pos0, const int32_t* to
 uint64_t Model::Impl::launch(int R, int pos0, const int32_t* tokens, const Sampling& sp, uint32_t flags, Sink* sink) {
   if (!bound) die("model: step before bind");
   const int pos_last = pos0 + R - 1;
-  if (R < 1 || R > kMaxRows || pos0 < 0 || pos_last >= opt.max_ctx ||
+  if (R < 1 || R > kMaxRows || pos0 < 0 || pos_last >= slot_ctx_[cur_slot] ||
       pos_last - (R - 1) / pos_group * pos_stride - (R - 1) % pos_group < 0)
     die("model: bad step R=%d pos0=%d", R, pos0);
   if (opt.first_layer > 0 && !(flags & kFlagInject) && (flags & (kFlagDump | kFlagLogits)))
@@ -691,7 +725,7 @@ uint64_t Model::Impl::launch_batch(const Batch& b) {
   int pos_last = 0;
   for (int r = 0; r < R; ++r) {
     const bool same = r > 0 && b.sess[r] == b.sess[r - 1];  // the session of the row before
-    bool ok = b.pos[r] >= 0 && b.pos[r] < opt.max_ctx && b.slot[r] >= 0 && b.slot[r] < nslots;
+    bool ok = b.slot[r] >= 0 && b.slot[r] < nslots && b.pos[r] >= 0 && b.pos[r] < slot_ctx_[b.slot[r]];
     if (r > 0 && !same) ok &= b.sess[r] == b.sess[r - 1] + 1;
     if (same) ok &= b.slot[r] == b.slot[r - 1] && b.pos[r] == b.pos[r - 1] + 1;
     int run = 1;  // the session's rows so far: at most kMaxSessRows (config.h: attn's race past it)
@@ -710,7 +744,7 @@ uint64_t Model::Impl::launch_batch(const Batch& b) {
   for (int r = 0; r < kMaxRows; ++r) {  // the entries past R repeat the last row's
     const int q = std::min(r, R - 1);
     in.tokens[r] = r < R ? b.tokens[r] : 0;
-    in.pos[r] = b.pos[q], in.slot[r] = b.slot[q], in.sess[r] = b.sess[q];
+    in.pos[r] = b.pos[q], in.slot[r] = unit_of[b.slot[q]], in.sess[r] = b.sess[q];
   }
   for (int k = 0; k < ops::kMaxSess; ++k) in.samp[k] = samp_of(b.sp[std::min(k, b.nsess - 1)]);
   in.rows = R;
@@ -726,10 +760,10 @@ uint64_t Model::Impl::launch_batch(const Batch& b) {
       late.on = true, late.any = false, late.batch = true;
       late.pos0 = b.pos[0], late.R = R, late.seq[0] = seq[0], late.seq[1] = seq[1];
       std::copy(b.pos, b.pos + kMaxRows, late.pos);
-      std::copy(b.slot, b.slot + kMaxRows, late.slot);
+      std::copy(in.slot, in.slot + kMaxRows, late.slot);  // units
     } else {
       if (n) wait_done(n - 1);  // the previous step has read the Engram buffers
-      engram_rows(R, b.tokens, b.pos, b.slot, seq);
+      engram_rows(R, b.tokens, b.pos, in.slot, seq);
     }
   }
   return run_step(n, R, scan_ctx(pos_last), b.flags, b.sink, b.pos[0]);
@@ -779,7 +813,9 @@ void Model::Impl::engram_late_rows(int R, const int32_t* tok, const int32_t* pos
   if (!late.on || !late.batch || !late.any) die("model: engram_late_rows with no batch verify step waiting for its tokens");
   if (R < 1 || R > kMaxRows) die("model: engram_late_rows(%d)", R);
   if (n_steps >= 2) wait_done(n_steps - 2);  // the step before it has read the Engram buffers
-  engram_rows(R, tok, pos, slot, late.seq);
+  int32_t u[kMaxRows];  // the server's slots -> units
+  for (int r = 0; r < R; ++r) u[r] = unit_of[slot[r]];
+  engram_rows(R, tok, pos, u, late.seq);
   late.on = false;
 }
 
@@ -794,6 +830,11 @@ const ops::SampleOut& Model::Impl::wait(uint64_t n) {
   }
   n_done = std::max(n_done, n + 1);
   last_n = n;
+  if (route_f) {
+    RouteRec r;
+    CUDA_CHECK(cudaMemcpy(&r, route_ring + n % kRouteRing, sizeof r, cudaMemcpyDeviceToHost));
+    if (r.step == (uint32_t)n) fwrite(&r, sizeof r, 1, route_f), fflush(route_f);
+  }
   return o;
 }
 
@@ -876,6 +917,7 @@ size_t Model::code_head(int* raw_tiles) { return d_->code_head(raw_tiles); }
 void Model::use_slot(int s) { d_->use_slot(s); }
 int Model::slot() const { return d_->cur_slot; }
 int Model::slots() const { return d_->nslots; }
+int Model::slot_ctx(int s) const { return d_->slot_ctx_[s]; }
 void Model::set_engram(const engram::HashMap* map, engram::Store* store) {
   d_->emap = map;
   d_->store = store;

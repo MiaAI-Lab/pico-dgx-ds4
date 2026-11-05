@@ -292,7 +292,8 @@ struct Args {
   std::string disk_tag;  // its files' tag: rank<r>.<tag>.spill (none: rank<r>.spill)
   double keep_gib = 0, keep_days = 7;  // kept sessions: written at a planned stop, at most; their age
   int snap_every = 1024, small_rows = 8;
-  int slots = 1, slot = 0;  // session slots (model::Options::slots); the golden modes' slot
+  int slots = 1, slot = 0;
+  int big_slots = 0;  // --big-slots B: slots [0, B) hold --max-ctx, the others --max-ctx / 8 (model::Options::big_slots)  // session slots (model::Options::slots); the golden modes' slot
   int bgraph_bodies = 0;      // DIAGNOSTICS (spec.cu, the batch graph): switch bodies to capture (0: kMaxRows)
   bool bgraph_noif = false;   // DIAGNOSTICS: the entries' accepts without if nodes
   bool bgraph_check = false;  // DIAGNOSTICS (B3 phase 2a): the one-session draft of every entry after the batch
@@ -382,6 +383,7 @@ Args parse(int argc, char** argv) {
     else if (s == "--keep-days") a.keep_days = std::atof(val().c_str());
     else if (s == "--snap-every") a.snap_every = std::atoi(val().c_str());
     else if (s == "--slots") a.slots = std::atoi(val().c_str());
+    else if (s == "--big-slots") a.big_slots = std::atoi(val().c_str());
     else if (s == "--bgraph-bodies") a.bgraph_bodies = std::atoi(val().c_str());
     else if (s == "--bgraph-noif") a.bgraph_noif = true;
     else if (s == "--bgraph-check") a.bgraph_check = true;
@@ -582,6 +584,7 @@ int main(int argc, char** argv) {
   mo.draft_head4 = a.draft_head4, mo.draft_markov8 = a.draft_markov8;
   mo.tree_probe = !a.tree_probe.empty();
   mo.slots = a.slots;
+  mo.big_slots = a.big_slots;
   mo.bgraph_bodies = a.bgraph_bodies, mo.bgraph_noif = a.bgraph_noif, mo.bgraph_check = a.bgraph_check;
   mo.l2pf = !a.no_l2pf;
   model::Model m(a.rank, mo);

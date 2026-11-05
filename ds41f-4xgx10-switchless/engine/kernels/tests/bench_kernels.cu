@@ -1413,6 +1413,72 @@ static void bench_head4() {
   cudaFree(W), cudaFree(X), cudaFree(x), cudaFree(nw), cudaFree(y);
 }
 
+
+// ---- wide decode MoE (moewide): decode-like random routes at R rows, the decode kernels (chunks of 16) against
+// moe_prefill, all 384 experts resident (random weights), cold-ish (weights 1.8 GB >> L2). MW_R, MW_ROUNDS.
+static void bench_moe_wide() {
+  const int E = 384, kD = 5120, kI = 576;
+  const size_t w13 = (size_t)kI * kD / 2, s13 = (size_t)kI * kD / 32, w2 = (size_t)kD * kI / 2, s2 = (size_t)kD * kI / 32;
+  dsk::MoeWeights mw{};
+  mw.w1 = dev_fill(E * w13, 1), mw.w3 = dev_fill(E * w13, 3), mw.w2 = dev_fill(E * w2, 5);
+  mw.s1 = dev_fill(E * s13, 2, 118, 8), mw.s3 = dev_fill(E * s13, 4, 118, 8), mw.s2 = dev_fill(E * s2, 6, 118, 8);
+  mw.sh_w1 = dev_fill((size_t)kI * kD, 10), mw.sh_s1 = dev_fill(kI / 32 * (kD / 32), 20, 118, 8);
+  mw.sh_w3 = dev_fill((size_t)kI * kD, 30), mw.sh_s3 = dev_fill(kI / 32 * (kD / 32), 40, 118, 8);
+  mw.sh_w2 = dev_fill((size_t)kD * kI, 50), mw.sh_s2 = dev_fill(kD / 32 * (kI / 32), 60, 118, 8);
+  std::vector<int> Rs = env_ints("MW_R"), rr = env_ints("MW_ROUNDS");
+  if (Rs.empty()) Rs = {1, 8, 16, 24, 32, 48, 64, 96, 128};
+  const int rounds = rr.empty() ? 15 : rr[0], copies = 8, Rmax = 128;
+  uint8_t* xq = dev_fill((size_t)Rmax * kD, 7);
+  uint8_t* xs = dev_fill((size_t)Rmax * kD / 32, 8, 118, 8);
+  int* idx; float* wts; float* y;
+  CUDA_CHECK(cudaMalloc(&idx, (size_t)copies * Rmax * 6 * 4));
+  CUDA_CHECK(cudaMalloc(&wts, (size_t)copies * Rmax * 6 * 4));
+  CUDA_CHECK(cudaMalloc(&y, (size_t)Rmax * kD * 4));
+  uint8_t* ws; const size_t wsb = dsk::moe_workspace_bytes();
+  CUDA_CHECK(cudaMalloc(&ws, wsb)); CUDA_CHECK(cudaMemset(ws, 0, wsb));
+  uint8_t* pws; CUDA_CHECK(cudaMalloc(&pws, dsk::moe_prefill_workspace_bytes(Rmax, E)));
+  std::vector<float> hw((size_t)copies * Rmax * 6, 0.25f);
+  CUDA_CHECK(cudaMemcpy(wts, hw.data(), hw.size() * 4, cudaMemcpyHostToDevice));
+  const double per_expert = 2.0 * (w13 + s13) + w2 + s2;
+  printf("moewide: %d experts, random distinct picks per row; us per call (median); bytes = union experts x %.2f MB\n", E, per_expert / 1e6);
+  printf("  %4s %7s | %9s %7s | %9s %7s | %9s\n", "R", "union", "decode", "GB/s", "prefill", "GB/s", "dec/row");
+  uint64_t seed = 12345;
+  auto rnd = [&]() { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(seed >> 33); };
+  for (int R : Rs) {
+    std::vector<int> h((size_t)copies * Rmax * 6);
+    double usum = 0;
+    for (int c = 0; c < copies; ++c) {
+      std::vector<char> seen(E, 0);
+      for (int m = 0; m < R; ++m) {
+        int got[6], n = 0;
+        while (n < 6) { int e = rnd() % E; bool dup = false; for (int j = 0; j < n; ++j) dup |= got[j] == e; if (!dup) got[n++] = e; }
+        std::sort(got, got + 6);
+        for (int j = 0; j < 6; ++j) h[((size_t)c * Rmax + m) * 6 + j] = got[j], seen[got[j]] = 1;
+      }
+      for (int e = 0; e < E; ++e) usum += seen[e];
+    }
+    usum /= copies;
+    CUDA_CHECK(cudaMemcpy(idx, h.data(), h.size() * 4, cudaMemcpyHostToDevice));
+    auto dec = [&](cudaStream_t s) {
+      for (int c = 0; c < copies; ++c)
+        for (int r0 = 0; r0 < R; r0 += 16) {
+          const int m = std::min(16, R - r0);
+          dsk::MoeCfg cfg{}; cfg.down = m == 1 ? 2 : 4;
+          dsk::moe(xq + (size_t)r0 * kD, xs + (size_t)r0 * kD / 32, m, idx + ((size_t)c * Rmax + r0) * 6,
+                   wts + ((size_t)c * Rmax + r0) * 6, mw, ws, y + (size_t)r0 * kD, cfg, s);
+        }
+    };
+    auto pre = [&](cudaStream_t s) {
+      for (int c = 0; c < copies; ++c)
+        dsk::moe_prefill(xq, xs, R, idx + (size_t)c * Rmax * 6, wts + (size_t)c * Rmax * 6, E, mw, pws, y, s);
+    };
+    const auto ts = time_interleaved({dec, pre}, rounds);
+    const double d = ts[0][ts[0].size() / 2] / copies, p = ts[1][ts[1].size() / 2] / copies;
+    const double bytes = usum * per_expert;
+    printf("  %4d %7.1f | %9.1f %7.1f | %9.1f %7.1f | %9.2f\n", R, usum, d, bytes / d / 1e3, p, bytes / p / 1e3, d / R);
+  }
+}
+
 int main(int argc, char** argv) {
   std::string filter = argc > 1 ? argv[1] : "";
   bool sweep = getenv("SWEEP") != nullptr;
@@ -1432,6 +1498,7 @@ int main(int argc, char** argv) {
   if (filter == "prefill") bench_prefill();  // PF_M="2048 4096", PF_ROUNDS
   if (filter == "psmall") small_gemms::run(true);  // the dense GEMMs' small-M tiles, cold L2
   if (filter == "moereal") bench_moe_real();  // PF_ROUTES=<prefix> or PF_TURNS, PF_M, PF_SCALES, PF_CODE, PF_CGRP, ...
+  if (filter == "moewide") bench_moe_wide();  // MW_R, MW_ROUNDS
   if (filter == "mscale") bench_mscale();     // MS_FILE, MS_LAYERS, MS_ROUNDS
   if (filter == "headsz")  // bandwidth vs matrix size
     for (int n : {1024, 4096, 8192, 16384, 32320}) bench_w16("head", n, 5120, false, false);

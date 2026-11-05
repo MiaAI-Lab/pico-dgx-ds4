@@ -545,13 +545,13 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf) {
   }
   sync();
   cudaFree(hc_tmp);
-  sp.draft = std::make_unique<dspark::Draft>(dw, rank, sp.comm.get(), sp.rope, nslots);
-  sp.draft->use_slot(cur_slot);
+  sp.draft = std::make_unique<dspark::Draft>(dw, rank, sp.comm.get(), sp.rope, nunits);
+  sp.draft->use_slot(cur_unit);
   if (opt.tree_probe) sp.draft->enable_probe();
   static_assert(kMaxRows <= dspark::kMaxHidden, "a batch spec step's rows fit the draft module's main_hidden tap");
   sp.mh = dalloc<uint16_t>((size_t)kMaxRows * dspark::kMainK);
   sp.ss = dalloc<ops::SpecState>(ops::kMaxSess);  // [0] the one-session step's; B3's entries' [k]
-  sp.bents = std::min(ops::kMaxSess, nslots);
+  sp.bents = std::min({ops::kMaxSess, nslots, kMaxSpecEnts});
   sp.row0 = dalloc<int>(ops::kMaxSess);
   sp.stab = dalloc<int>((size_t)ops::kMaxSess * dspark::kMaxAcc);
   // B3 phase 2a: the draft passes over the entries (spec_batch_passes' list and tables, the draft module's
@@ -687,7 +687,7 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
   CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, &sw, nullptr, 1, mode));
   ops::sample(ch, logits, kVocabPart * rank, in_d, ctl_h, out_h, fb, samp_ctr, st, sp.ss, ops::kLowRows);
   // the step's session's windows (every entry of its slot table holds its slot)
-  const int* slot = nslots > 1 ? in_d->slot : nullptr;
+  const int* slot = nunits > 1 ? in_d->slot : nullptr;
   sp.draft->accept(sp.mh, &sp.ss->count, &sp.ss->pos0, st, slot);
   sp.draft->draft(&sp.ss->bonus, st, slot);
   if (opt.tree_probe) {  // EXPERIMENT (docs/engine.md, "Draft trees")
@@ -962,7 +962,7 @@ void Model::Impl::spec_fill(ops::StepIn& in, int mode, const SpecCfg& c) {
 uint64_t Model::Impl::launch_spec(int R, int pos0, const int32_t* tokens, const Sampling& sp, const SpecCfg& c) {
   if (!spec) die("model: launch_spec without bind_spec");
   const int pos_last = pos0 + R - 1;
-  if (R < 1 || R > kMaxSessRows || pos0 < 0 || pos_last >= opt.max_ctx)  // the switch has kMaxSessRows bodies
+  if (R < 1 || R > kMaxSessRows || pos0 < 0 || pos_last >= slot_ctx_[cur_slot])  // the switch has kMaxSessRows bodies
     die("model: bad spec step R=%d pos0=%d (at most %d rows: one session's)", R, pos0, kMaxSessRows);
   for (int r = 0; r < R; ++r)
     if (tokens[r] < 0) die("model: launch_spec takes the step's tokens");
@@ -1022,9 +1022,9 @@ void Model::Impl::spec_fill_batch(ops::StepIn& in, int mode, const SpecBatch& b)
   for (int k = 0; k < ops::kMaxSess; ++k) {
     const bool has = k < b.n;
     in.sess_on[k] = has && b.on[k] ? 1 : 0;
-    in.sess_slot[k] = has ? b.slot[k] : 0;
+    in.sess_slot[k] = has ? unit_of[b.slot[k]] : 0;
     in.scap[k] = has ? std::max(0, std::min(ops::kDrafts, b.cap[k])) : 0;
-    in.spos_end[k] = has ? std::min(b.pos_end[k], opt.max_ctx) : 0;
+    in.spos_end[k] = has ? std::min(b.pos_end[k], slot_ctx_[b.slot[k]]) : 0;
     in.sthresh[k] = has ? b.thresh[k] : 0.f;
   }
 }
@@ -1045,7 +1045,7 @@ int Model::Impl::spec_batch_check(const SpecBatch& b, bool given) {
     if (b.cap[k] < 0 || b.cap[k] > ops::kDrafts || 1 + b.cap[k] > kMaxSessRows)
       die("model: batch spec entry %d with %d drafts", k, b.cap[k]);
     rows += 1 + b.cap[k];
-    if (given && (b.token[k] < 0 || b.pos0[k] < 0 || b.pos0[k] >= opt.max_ctx))
+    if (given && (b.token[k] < 0 || b.pos0[k] < 0 || b.pos0[k] >= slot_ctx_[b.slot[k]]))
       die("model: batch spec entry %d: token %d at %d", k, b.token[k], b.pos0[k]);
   }
   if (S < 1) die("model: a batch spec step with no entry on");
@@ -1061,7 +1061,7 @@ uint64_t Model::Impl::launch_spec_batch(const SpecBatch& b) {
   int R = 0, pos_last = 0;
   for (int k = 0; k < b.n; ++k) {  // one row per entry on, in entry order
     if (!b.on[k]) continue;
-    in.tokens[R] = b.token[k], in.pos[R] = b.pos0[k], in.slot[R] = b.slot[k], in.sess[R] = k;
+    in.tokens[R] = b.token[k], in.pos[R] = b.pos0[k], in.slot[R] = unit_of[b.slot[k]], in.sess[R] = k;
     pos_last = std::max(pos_last, b.pos0[k]);
     ++R;
   }
@@ -1100,7 +1100,7 @@ uint64_t Model::Impl::launch_verify_batch(const SpecBatch& b) {
   int slot0 = 0;
   for (int k = 0; k < b.n; ++k)
     if (b.on[k]) {
-      slot0 = b.slot[k];
+      slot0 = unit_of[b.slot[k]];
       break;
     }
   for (int r = 0; r < kMaxRows; ++r) in.tokens[r] = 0, in.pos[r] = 0, in.slot[r] = slot0, in.sess[r] = 0;  // the device's

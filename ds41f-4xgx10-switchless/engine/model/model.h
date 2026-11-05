@@ -128,6 +128,8 @@ struct Options {
   int slots = 1;            // session slots (docs/batching.md): live sessions' states side by side (each one's
                             // window rings, compressed caches, index keys, carries and draft windows), up to
                             // kMaxSlots; ~240 MB a slot at 262,144 positions
+  int big_slots = 0;        // with 0 < big_slots < slots: slots [0, big_slots) cover max_ctx, the others
+                            // max_ctx / kUnitMul (slot_ctx); 0: every slot covers max_ctx
   int bgraph_bodies = 0;    // DIAGNOSTICS (spec.cu, 2026-10-13): the batch spec graph's switch bodies (0: kMaxRows)
   bool bgraph_noif = false; // DIAGNOSTICS: the entries' accepts at the top level, without if nodes
   bool bgraph_check = false;  // DIAGNOSTICS (B3 phase 2a): after the batch step's draft pass over the entries, every
@@ -167,6 +169,7 @@ class Model {
   void use_slot(int s);
   int slot() const;
   int slots() const;
+  int slot_ctx(int s) const;  // positions slot s holds (Options::big_slots)
 
   // Queue one step of R rows at positions pos0 .. pos0 + R - 1 on every rank, without waiting for it;
   // returns its number. tokens[r] >= 0 is the token; -1 - j stands for row j of the previous step's

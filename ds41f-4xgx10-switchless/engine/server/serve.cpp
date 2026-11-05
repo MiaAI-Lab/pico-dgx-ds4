@@ -457,7 +457,7 @@ class Server {
         Request rq = std::move(ready_.front());
         ready_.pop_front();
         admit(std::move(rq));
-      } else if (!wait_.empty() && pick_slot({}) >= 0) {
+      } else if (!wait_.empty() && pick_slot({}, need_clamped(wait_.front())) >= 0) {
         Request rq = std::move(wait_.front());
         wait_.pop_front();
         admit(std::move(rq));
@@ -850,7 +850,9 @@ class Server {
   void admit(Request&& rq) {
     if (flying_.count(rq.h.session_id)) return held_.push_back(std::move(rq));
     const auto it = sess_.find(rq.h.session_id);
-    if ((it == sess_.end() || it->second.slot < 0) && pick_slot({}) < 0) return wait_.push_back(std::move(rq));
+    const int need = need_clamped(rq);
+    if ((it == sess_.end() || it->second.slot < 0 || !fits(it->second.slot, need)) && pick_slot({}, need) < 0)
+      return wait_.push_back(std::move(rq));
     start(std::move(rq));
   }
 
@@ -918,12 +920,14 @@ class Server {
     // the session's own slot. A fork takes its base's when no request of the base is in flight: the base's
     // state goes to the store, and the fork goes on from it in place. A base in flight keeps its slot; its
     // state goes to the store, and the fork starts from there in a slot of its own.
+    const int need = need_clamped(f.rq);
     int s = S ? S->slot : -1;
+    if (s >= 0 && !fits(s, need)) persist_slot(s, true), s = -1;  // a small slot: the session moves to a big one
     if (!S && src && src->slot >= 0) {
-      if (!flying_.count(src_id)) s = src->slot;
+      if (!flying_.count(src_id) && fits(src->slot, need)) s = src->slot;
       else persist_slot(src->slot, false);
     }
-    if (s < 0) s = pick_slot(keep);
+    if (s < 0) s = pick_slot(keep, need);
     if (s < 0) die("serve: no slot for request %llu", (unsigned long long)h.req_id);  // admit() saw one
     const bool src_live = src && src->slot == s;
     const int p = src ? std::min(lcp(src->hist, prompt), n - 1) : 0;
@@ -1117,17 +1121,28 @@ class Server {
   }
   static bool stop_id(const Flight& f, int32_t t) { return std::count(f.rq.stop.begin(), f.rq.stop.end(), t) > 0; }
 
-  // A slot for a session that holds none: a free one; else the least recently used one whose session no
-  // request uses (its state goes to the store); else, with time-slicing, the slot of the paused request
-  // whose turn comes last. Never the slot of a session in `keep`. -1: none.
-  int pick_slot(const std::set<uint64_t>& keep) const {
+  // Positions a request may reach: its prompt and every token it may generate (the slot must hold them).
+  static int need_of(const Request& rq) {
+    return (int)std::min<int64_t>((int64_t)rq.prompt.size() + rq.h.max_new_tokens, INT32_MAX / 2);
+  }
+  int need_of(const Flight& f) const { return std::min(need_of(f.rq), o_.max_ctx); }
+  int need_clamped(const Request& rq) const { return std::min(need_of(rq), o_.max_ctx);
+  }
+  bool fits(int s, int need) const { return need <= m_.slot_ctx(s); }
+  // A slot for a session that holds none, among those that hold `need` positions (with big slots, the small
+  // ones first): a free one; else the least recently used one whose session no request uses (its state goes
+  // to the store); else, with time-slicing, the slot of the paused request whose turn comes last. Never the
+  // slot of a session in `keep`. -1: none.
+  int pick_slot(const std::set<uint64_t>& keep, int need = 0) const {
     const int ns = (int)slot_.size();
-    for (int s = 0; s < ns; ++s)
-      if (!slot_[s]) return s;
+    const int big = m_.slot_ctx(0);
+    for (int pass = 0; pass < 2; ++pass)  // small slots first (big_slots), so that the big ones stay for long requests
+      for (int s = 0; s < ns; ++s)
+        if (!slot_[s] && fits(s, need) && (pass == 1 || m_.slot_ctx(s) < big)) return s;
     int best = -1;
     uint64_t used = UINT64_MAX;
     for (int s = 0; s < ns; ++s) {
-      if (flying_.count(slot_[s]) || keep.count(slot_[s])) continue;
+      if (!fits(s, need) || flying_.count(slot_[s]) || keep.count(slot_[s])) continue;
       const auto it = sess_.find(slot_[s]);
       const uint64_t u = it == sess_.end() ? 0 : it->second.used;
       if (u < used) best = s, used = u;
@@ -1135,7 +1150,8 @@ class Server {
     if (best >= 0 || o_.slice <= 0) return best;
     for (auto it = rot_.rbegin(); it != rot_.rend(); ++it) {
       const auto x = sess_.find(it->rq.h.session_id);
-      if (x != sess_.end() && x->second.slot >= 0 && !keep.count(x->first)) return x->second.slot;
+      if (x != sess_.end() && x->second.slot >= 0 && !keep.count(x->first) && fits(x->second.slot, need))
+        return x->second.slot;
     }
     return -1;
   }
@@ -1153,15 +1169,23 @@ class Server {
   void run() {
     std::vector<Flight> fl;
     std::set<uint64_t> keep;
+    std::deque<Flight> later;  // big_slots: flights that need a big slot while every one is in this run
     while (fl.size() < slot_.size() && !rot_.empty()) {
       Flight f = std::move(rot_.front());
       rot_.pop_front();
-      f.paused_s += now_s() - f.t_paused;
       const auto it = sess_.find(f.rq.h.session_id);
-      if ((it == sess_.end() || it->second.slot < 0) && !go(f, true, keep)) continue;
+      const int need = need_clamped(f.rq);
+      const bool live = it != sess_.end() && it->second.slot >= 0 && fits(it->second.slot, need);
+      if (!live && pick_slot(keep, need) < 0) {
+        later.push_back(std::move(f));
+        continue;
+      }
+      f.paused_s += now_s() - f.t_paused;
+      if (!live && !go(f, true, keep)) continue;
       keep.insert(f.rq.h.session_id);
       fl.push_back(std::move(f));
     }
+    for (auto it = later.rbegin(); it != later.rend(); ++it) rot_.push_front(std::move(*it));
     if (fl.empty()) return;
     const bool turns = o_.slice > 0 && !rot_.empty();  // requests wait for a slot: a turn each
     std::vector<uint32_t> why(fl.size());
@@ -1201,7 +1225,7 @@ class Server {
     c.tokens[0] = f.out.back();
     c.sp = f.sp;
     c.max_new = turns ? std::min(left, o_.slice) : left;  // a turn while others wait for a slot
-    c.limit = o_.max_ctx;
+    c.limit = m_.slot_ctx(S->slot);
     c.n_stop = (int)f.rq.stop.size();
     std::copy(f.rq.stop.begin(), f.rq.stop.end(), c.stop);
     c.ahead = 1;
@@ -1271,7 +1295,7 @@ class Server {
       x.slot = S[k]->slot, x.handle = S[k]->h, x.pos0 = pos, x.token = f.out.back();
       const int left = (int)f.rq.h.max_new_tokens - (int)f.out.size();
       x.max_new = turns ? std::min(left, o_.slice) : left;  // a turn while others wait for a slot
-      x.limit = o_.max_ctx, x.snap_every = o_.snap_every;
+      x.limit = m_.slot_ctx(S[k]->slot), x.snap_every = o_.snap_every;
       x.n_stop = (int)f.rq.stop.size();
       std::copy(f.rq.stop.begin(), f.rq.stop.end(), x.stop);
       x.sp = f.sp;
