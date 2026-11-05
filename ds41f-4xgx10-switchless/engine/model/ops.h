@@ -25,12 +25,12 @@ enum : int32_t { kSpecOff = 0, kSpecGiven = 1, kSpecVerify = 2 };
 // - kGateMarginal: draft j while survival[j - 1] >= thresh * (step_ms[j] - step_ms[j - 1]), thresh then
 //   being the tokens per ms of the steps so far.
 enum : int32_t { kGateThresh = 0, kGateRatio = 1, kGateMarginal = 2 };
-constexpr int kMaxSess = kMaxRows;  // sessions in a step, at most (docs/batching.md, B2)
+constexpr int kMaxSess = 16;  // sessions in a step, at most (docs/batching.md, B2; wide64: no longer kMaxRows)
 // The runner's kernels whose launch geometry holds the rows (sample's grid and posted bytes, fused.cu's block
 // sizes) launch as they did before B4 up to kLowRows rows, and sized for kMaxRows past them (as dsk's
 // row_budget): a step of at most 8 rows runs the kernels and launches it ran.
 constexpr int kLowRows = 8;
-constexpr int row_budget(int R) { return R <= kLowRows ? kLowRows : kMaxRows; }
+constexpr int row_budget(int R) { return R <= kLowRows ? kLowRows : R <= kDecodeRows ? kDecodeRows : kMaxRows; }
 constexpr int kSessTok = 1 + kDrafts;  // a session's rows in a spec step, at most: its bonus token and its drafts
 static_assert(kSessTok <= kMaxSessRows, "a session's spec rows fit its rows of a step");
 struct StepSamp {  // one session's sampling (model::Sampling)
@@ -147,7 +147,7 @@ struct SpecState {
 // kLowRows, a batch graph's kMaxRows).
 void sample(const comm::DevChannel& ch, const float* logits, int vocab0, const StepIn* in, const uint32_t* ctl,
             SampleOut* outs, int32_t* fb, uint32_t* counter, cudaStream_t s, SpecState* ss = nullptr,
-            int max_rows = kMaxRows);
+            int max_rows = kDecodeRows);
 
 // x [R][4][5120] = embed[tokens[r]] in every copy; pre_mix [R][4] = (1, 0, 0, 0).
 void embed(const bf16* table, const int* tokens, int R, bf16* x, float* pre_mix, cudaStream_t s);

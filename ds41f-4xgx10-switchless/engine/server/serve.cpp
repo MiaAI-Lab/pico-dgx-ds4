@@ -1283,7 +1283,7 @@ class Server {
   // drafts the last one left pauses, to go on alone. Each one's end (fe::k*), or kPaused / kTurn, in why.
   void decode_batch(std::vector<Flight>& fl, bool turns, std::vector<uint32_t>& why) {
     const int n = (int)fl.size();
-    const bool drafts = o_.spec && m_.spec() && n <= model::kMaxRows / 2 && n <= m_.spec_batch_entries();
+    const bool drafts = o_.spec && m_.spec() && n <= model::kDecodeRows / 2 && n <= m_.spec_batch_entries();
     std::vector<BatchEntry> e(n);
     std::vector<Session*> S(n);
     for (int k = 0; k < n; ++k) {

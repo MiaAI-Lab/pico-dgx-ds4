@@ -3,6 +3,7 @@
 // loads its first weights while the contributions travel), waits, and consumes the four
 // contributions in place, in rank order, exactly as the standalone collective plus the kernels it
 // replaces would.
+#include <algorithm>
 #include <type_traits>
 
 #include "attn/launch.h"
@@ -29,7 +30,8 @@ __device__ __forceinline__ void wait_prev() { asm volatile("griddepcontrol.wait;
 // of host memory instead queue up for them (~11 µs at one row).
 // The block holds the rows (an item per thread), so the kernels whose block size depends on the rows come in
 // two instances by the row budget RB (ops.h row_budget): kLowRows, the kernels and launches of before B4, for
-// steps of at most 8 rows; kMaxRows for 9..16.
+// steps of at most 8 rows; kDecodeRows for 9..16. wide64: 17..kMaxRows rows take k_allreduce_hc_wide (1024
+// threads, items in a loop): each item's arithmetic is the same, so every output has the same bits.
 constexpr int kArGrid = 40;
 constexpr int kArCols = kDim / kArGrid;  // 128
 // (kMixStride, ops.h: floats per row of the mix partials, after the partial sums)
@@ -188,8 +190,8 @@ __global__ void __launch_bounds__(256) k_allgather_attn(comm::DevChannel ch, con
   uint8_t* sb = comm::send_buf(ch, s);
   for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < per_rank / 16; i += gridDim.x * blockDim.x)
     reinterpret_cast<uint4*>(sb)[i] = reinterpret_cast<const uint4*>(pack)[i];
-  const int gi = blockIdx.x * blockDim.x + threadIdx.x;  // mix value gi % kMixStride of row gi / kMixStride
-  if (chunks && gi < R * kMixStride) {
+  // mix value gi % kMixStride of row gi / kMixStride (wide64: a loop past the grid's 1024 threads)
+  for (int gi = blockIdx.x * blockDim.x + threadIdx.x; chunks && gi < R * kMixStride; gi += gridDim.x * blockDim.x) {
     const int v = gi % kMixStride;
     reinterpret_cast<float*>(sb + per_rank)[gi] = v < 25 ? chunk_sum(chunks, nchunks, R, gi / kMixStride, v) : 0.f;
   }
@@ -231,21 +233,24 @@ __global__ void __launch_bounds__(256) k_allgather_attn(comm::DevChannel ch, con
 // allreduce_hc_mix's hook does). One block of a warp per row of the budget RB (kLowRows: the 256 threads of
 // before B4). Launched without PDL behind an event, after the kernel that finished the previous collective,
 // so next_seq is this one's.
+// wide64: RB = kMaxRows runs 32 warps, each over rows warp, warp + 32 (the same per-row arithmetic).
 template <int RB>
-__global__ void __launch_bounds__(32 * RB) k_mix_allreduce(comm::DevChannel ch, const float* chunks, int nchunks, int R,
-                                                           const float* scale, const float* base, float* pre, float* post,
-                                                           float* comb) {
-  const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+__global__ void __launch_bounds__(32 * (RB < 32 ? RB : 32)) k_mix_allreduce(comm::DevChannel ch, const float* chunks,
+                                                                           int nchunks, int R, const float* scale,
+                                                                           const float* base, float* pre, float* post,
+                                                                           float* comb) {
+  const int t = threadIdx.x, lane = t & 31;
+  constexpr int kNT = 32 * (RB < 32 ? RB : 32);
   float sc = 0.f, bs = 0.f;
-  if (warp < R) sc = attn::hc_lane_scale(scale, lane), bs = attn::hc_lane_base(base, lane);
+  if ((t >> 5) < R) sc = attn::hc_lane_scale(scale, lane), bs = attn::hc_lane_base(base, lane);
   const uint64_t s = comm::next_seq(ch);
-  if (t < R * kMixStride) {
-    const int v = t % kMixStride;
-    reinterpret_cast<float*>(comm::send_buf(ch, s))[t] = v < 25 ? chunk_sum(chunks, nchunks, R, t / kMixStride, v) : 0.f;
+  for (int i = t; i < R * kMixStride; i += kNT) {
+    const int v = i % kMixStride;
+    reinterpret_cast<float*>(comm::send_buf(ch, s))[i] = v < 25 ? chunk_sum(chunks, nchunks, R, i / kMixStride, v) : 0.f;
   }
   comm::post_grid(ch, s, (uint32_t)R * kMixStride * 4);
   comm::wait_all(ch, s);
-  if (warp < R) {
+  for (int warp = t >> 5; warp < R; warp += kNT / 32) {
     float mv = 0.f;
     if (lane < 25) {
       const size_t o = ((size_t)warp * kMixStride + lane) * 4;
@@ -264,11 +269,11 @@ __global__ void __launch_bounds__(32 * RB) k_mix_allreduce(comm::DevChannel ch, 
 // The mixes from the four ranks' partial sums mix [kRanks][R][kMixStride], added in rank order (warp w:
 // row w), with attn::hc_finish's arithmetic: allreduce_hc_mix's hook, as a kernel of its own. One block of a
 // warp per row (R <= kMaxRows).
-__global__ void __launch_bounds__(32 * kMaxRows) k_mix_ranks(const float* mix, int R, const float* scale,
-                                                             const float* base, float* pre, float* post, float* comb) {
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  if (warp >= R) return;
+__global__ void __launch_bounds__(32 * kDecodeRows) k_mix_ranks(const float* mix, int R, const float* scale,
+                                                                const float* base, float* pre, float* post, float* comb) {
+  const int lane = threadIdx.x & 31;
   const float sc = attn::hc_lane_scale(scale, lane), bs = attn::hc_lane_base(base, lane);
+  for (int warp = threadIdx.x >> 5; warp < R; warp += blockDim.x >> 5) {  // wide64: rows past the block's warps
   float mv = 0.f;
   if (lane < 25) {
     mv = mix[warp * kMixStride + lane];
@@ -279,6 +284,120 @@ __global__ void __launch_bounds__(32 * kMaxRows) k_mix_ranks(const float* mix, i
   if (lane < kHc) pre[warp * kHc + lane] = m;
   else if (lane < 2 * kHc) post[warp * kHc + lane - kHc] = m;
   else if (lane < kMix) comb[warp * kHc * kHc + lane - 2 * kHc] = m;
+  }
+}
+
+// wide64: k_allreduce_hc for 17..kMaxRows rows. The same per-item arithmetic as k_allreduce_hc (so the same bits),
+// the items in a loop over 1023 threads (warp 0 keeps no item, as there), the mixes' hook a loop over the rows.
+constexpr int kWideThreads = 1024;
+template <bool kF32, bool kMixes>
+__global__ void __launch_bounds__(kWideThreads)
+    k_allreduce_hc_wide(comm::DevChannel ch, const uint8_t* part, int R, const float* chunks, int nchunks,
+                        const float* scale, const float* base, const uint16_t* res, float* pre, float* post, float* comb,
+                        uint16_t* stream, uint16_t* yraw, uint16_t* sub) {
+  constexpr int N = kF32 ? 4 : 8, kItems = kArCols / N, ES = kF32 ? 4 : 2;
+  using Vec = BfVec<N>;
+  const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+  constexpr int kNW = kWideThreads / 32;
+  float sc = 0.f, bs = 0.f;
+  if (kMixes && blockIdx.x == 0) {
+    sc = attn::hc_lane_scale(scale, lane);
+    bs = attn::hc_lane_base(base, lane);
+  }
+  wait_prev();
+  const uint64_t s = comm::next_seq(ch);
+  uint8_t* sb = comm::send_buf(ch, s);
+  const int nitems = R * kItems;
+  for (int i = t - 32; i < nitems; i += kWideThreads - 32) {
+    if (i < 0) continue;
+    const int r = i / kItems, d0 = blockIdx.x * kArCols + (i % kItems) * N;
+    const size_t off = ((size_t)r * kDim + d0) * ES;
+    *reinterpret_cast<uint4*>(sb + off) = *reinterpret_cast<const uint4*>(part + off);
+  }
+  const size_t moff = (size_t)R * kDim * ES;
+  if (kMixes)
+    for (int rb = blockIdx.x; rb < R; rb += gridDim.x)
+      if (t < 25) reinterpret_cast<float*>(sb + moff)[rb * kMixStride + t] = chunk_sum(chunks, nchunks, R, rb, t);
+  comm::post_grid(ch, s, (uint32_t)(moff + (kMixes ? (size_t)R * kMixStride * 4 : 0)));
+  launch_dependents();
+  if constexpr (kMixes) {
+    comm::wait_all(ch, s, [&] {
+      for (int w = warp; w < R; w += kNW) {
+        float mv = 0.f;
+        if (lane < 25) {
+          const size_t o = moff + ((size_t)w * kMixStride + lane) * 4;
+          mv = __ldcv(reinterpret_cast<const float*>(comm::src(ch, s, 0) + o));
+#pragma unroll
+          for (int k = 1; k < kRanks; ++k)
+            mv = __fadd_rn(mv, __ldcv(reinterpret_cast<const float*>(comm::src(ch, s, k) + o)));
+        }
+        const float m = attn::hc_sinkhorn_warp(mv, lane, sc, bs);
+        if (lane < kHc) pre[w * kHc + lane] = m;
+        else if (lane < 2 * kHc) post[w * kHc + lane - kHc] = m;
+        else if (lane < kMix) comb[w * kHc * kHc + lane - 2 * kHc] = m;
+      }
+    });
+  } else {
+    comm::wait_all(ch, s);
+  }
+  for (int i = t - 32; i < nitems; i += kWideThreads - 32) {
+    if (i < 0) continue;
+    const int r = i / kItems, d0 = blockIdx.x * kArCols + (i % kItems) * N;
+    const size_t off = ((size_t)r * kDim + d0) * ES;
+    Vec xin[kHc];
+    float po[kHc], pr[kHc], cb[kHc * kHc];
+#pragma unroll
+    for (int c = 0; c < kHc; ++c) xin[c] = *reinterpret_cast<const Vec*>(res + (size_t)r * kHcDim + (size_t)c * kDim + d0);
+    if (kMixes) {
+#pragma unroll
+      for (int j = 0; j < kHc; ++j) po[j] = __ldcg(post + r * kHc + j), pr[j] = __ldcg(pre + r * kHc + j);
+#pragma unroll
+      for (int j = 0; j < kHc * kHc; ++j) cb[j] = __ldcg(comb + r * kHc * kHc + j);
+    } else {
+#pragma unroll
+      for (int j = 0; j < kHc; ++j) po[j] = post[r * kHc + j], pr[j] = yraw ? pre[r * kHc + j] : 0.f;
+#pragma unroll
+      for (int j = 0; j < kHc * kHc; ++j) cb[j] = comb[r * kHc * kHc + j];
+    }
+    float v[N];
+    if constexpr (kF32) {
+      const float4 a = comm::sum4_f32(ch, s, off);
+      v[0] = a.x, v[1] = a.y, v[2] = a.z, v[3] = a.w;
+    } else {
+      comm::sum8_bf16(ch, s, off, v);
+    }
+#pragma unroll
+    for (int j = 0; j < N; ++j) v[j] = bf2f(f2bf(v[j]));
+    if (sub) *reinterpret_cast<Vec*>(sub + (size_t)r * kDim + d0) = pack_bf16<N>(v);
+    float y[kHc][N];
+#pragma unroll
+    for (int j = 0; j < N; ++j) {
+      float x[kHc];
+#pragma unroll
+      for (int c = 0; c < kHc; ++c) x[c] = bf2f(reinterpret_cast<const uint16_t*>(&xin[c])[j]);
+#pragma unroll
+      for (int c = 0; c < kHc; ++c) {
+        float a = __fadd_rn(__fmul_rn(cb[c], x[0]), __fmul_rn(cb[4 + c], x[1]));
+        a = __fadd_rn(a, __fmul_rn(cb[8 + c], x[2]));
+        a = __fadd_rn(a, __fmul_rn(cb[12 + c], x[3]));
+        y[c][j] = bf2f(f2bf(__fadd_rn(__fmul_rn(po[c], v[j]), a)));
+      }
+    }
+    uint16_t* so = stream + (size_t)r * kHcDim;
+#pragma unroll
+    for (int c = 0; c < kHc; ++c) *reinterpret_cast<Vec*>(so + (size_t)c * kDim + d0) = pack_bf16<N>(y[c]);
+    if (yraw) {
+      float a[N];
+#pragma unroll
+      for (int j = 0; j < N; ++j) {
+        float q = __fadd_rn(__fmul_rn(pr[0], y[0][j]), __fmul_rn(pr[1], y[1][j]));
+        q = __fadd_rn(q, __fmul_rn(pr[2], y[2][j]));
+        a[j] = __fadd_rn(q, __fmul_rn(pr[3], y[3][j]));
+      }
+      *reinterpret_cast<Vec*>(yraw + (size_t)r * kDim + d0) = pack_bf16<N>(a);
+    }
+  }
+  comm::finish_grid(ch, s);
 }
 
 template <bool kF32, bool kMixes>
@@ -293,8 +412,13 @@ void launch_allreduce_hc(const comm::DevChannel& ch, const void* part, int R, co
                  true, ch, static_cast<const uint8_t*>(part), R, chunks, nchunks, scale, base,
                  reinterpret_cast<const uint16_t*>(res), pre, post, comb, reinterpret_cast<uint16_t*>(stream),
                  reinterpret_cast<uint16_t*>(yraw), reinterpret_cast<uint16_t*>(sub));
+  else if (R > kDecodeRows)
+    attn::launch(k_allreduce_hc_wide<kF32, kMixes>, dim3(kArGrid), dim3(kWideThreads), 0, s, true, ch,
+                 static_cast<const uint8_t*>(part), R, chunks, nchunks, scale, base,
+                 reinterpret_cast<const uint16_t*>(res), pre, post, comb, reinterpret_cast<uint16_t*>(stream),
+                 reinterpret_cast<uint16_t*>(yraw), reinterpret_cast<uint16_t*>(sub));
   else
-    attn::launch(k_allreduce_hc<kF32, kMixes, kMaxRows>, dim3(kArGrid), dim3((ArShape<kF32, kMaxRows>::kThreads)), 0, s,
+    attn::launch(k_allreduce_hc<kF32, kMixes, kDecodeRows>, dim3(kArGrid), dim3((ArShape<kF32, kDecodeRows>::kThreads)), 0, s,
                  true, ch, static_cast<const uint8_t*>(part), R, chunks, nchunks, scale, base,
                  reinterpret_cast<const uint16_t*>(res), pre, post, comb, reinterpret_cast<uint16_t*>(stream),
                  reinterpret_cast<uint16_t*>(yraw), reinterpret_cast<uint16_t*>(sub));
@@ -338,15 +462,19 @@ void mix_allreduce(const comm::DevChannel& ch, const float* chunks, int nchunks,
   if (R <= kLowRows)
     attn::launch(k_mix_allreduce<kLowRows>, dim3(1), dim3(32 * kLowRows), 0, s, false, ch, chunks, nchunks, R, scale, base,
                  pre, post, comb);
+  else if (R <= kDecodeRows)
+    attn::launch(k_mix_allreduce<kDecodeRows>, dim3(1), dim3(32 * kDecodeRows), 0, s, false, ch, chunks, nchunks, R, scale,
+                 base, pre, post, comb);
   else
-    attn::launch(k_mix_allreduce<kMaxRows>, dim3(1), dim3(32 * kMaxRows), 0, s, false, ch, chunks, nchunks, R, scale, base,
-                 pre, post, comb);
+    attn::launch(k_mix_allreduce<kMaxRows>, dim3(1), dim3(32 * 32), 0, s, false, ch, chunks, nchunks, R, scale, base, pre,
+                 post, comb);
 }
 
 void mix_ranks(const float* mix, int R, const float* scale, const float* base, float* pre, float* post, float* comb,
                cudaStream_t s) {
   if (R < 1 || R > kMaxRows) die("mix_ranks: %d rows", R);
-  attn::launch(k_mix_ranks, dim3(1), dim3(32 * R), 0, s, false, mix, R, scale, base, pre, post, comb);
+  attn::launch(k_mix_ranks, dim3(1), dim3(32 * std::min(R, kDecodeRows)), 0, s, false, mix, R, scale, base, pre, post,
+               comb);
 }
 
 }  // namespace model::ops

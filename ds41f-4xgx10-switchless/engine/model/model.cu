@@ -153,8 +153,9 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
   oq = dalloc<uint8_t>((size_t)R * kOPart);
   os = dalloc<uint8_t>((size_t)R * kOPart / 32);
   pack = dalloc<uint8_t>(ops::attn_pack_bytes(R, 2));
-  keys = dalloc<uint16_t>((size_t)R * kstride);
-  bkeys = dalloc<uint16_t>((size_t)R * kstride / 8);
+  // the index scans' key buffers: one group of kDecodeRows rows (wide64 steps run the indexer in groups)
+  keys = dalloc<uint16_t>((size_t)kDecodeRows * kstride);
+  bkeys = dalloc<uint16_t>((size_t)kDecodeRows * kstride / 8);
   for (int i = 0; i < kIdxSlots; ++i) {
     topk[i] = dalloc<int>((size_t)R * kIdxTopk);
     topkey[i] = dalloc<uint16_t>((size_t)R * kIdxTopk);
@@ -162,6 +163,7 @@ Model::Impl::Impl(int r, const Options& op) : rank(r), opt(op) {
   pool = dalloc<int>((size_t)R * kPoolBlocks);
   poolkey = dalloc<uint16_t>((size_t)R * kPoolBlocks);
   moe_ws = dalloc<uint8_t>(dsk::moe_workspace_bytes());
+  moe_pws = dalloc<uint8_t>(dsk::moe_prefill_workspace_bytes(kMaxRows, kExperts));  // wide64: moe_prefill's
   in_h = halloc<ops::StepIn>(ops::kInSlots);
   in_d = dalloc<ops::StepIn>(1);
   tok_d = in_d->tokens;
@@ -501,7 +503,12 @@ void Model::Impl::engram_apply(int L, int R) {
   ops::wait_seq(&e_done[e], &in_d->e_wait[e], st);
   comm::allgather(ch, e_send[e], e_gath, engram_seg(R), st);
   ops::engram_pack(e_gath, e_off[e], R, e_xq, e_xs, st);
-  dsk::gemv_fp8(e_xq, e_xs, R, w.e_wkv, w.e_skv, kEngramN, kEngramK, e_kv, c8k, st);
+  if (R > kDecodeRows) {  // wide64
+    const dsk::Fp8Seg es{w.e_wkv, w.e_skv, e_kv, kEngramN};
+    dsk::gemm_fp8_p(e_xq, e_xs, R, &es, 1, kEngramK, st);
+  } else {
+    dsk::gemv_fp8(e_xq, e_xs, R, w.e_wkv, w.e_skv, kEngramN, kEngramK, e_kv, c8k, st);
+  }
   ops::engram_partial(x, e_kv, w.e_w, rank, R, e_part, st);
   comm::allgather(ch, e_part, e_pgath, (size_t)R * kEngramPartBytes, st);
   ops::engram_combine(x, e_pgath, R, x, st);
@@ -512,18 +519,29 @@ void Model::Impl::engram_apply(int L, int R) {
 // The index scores and top-k (layer 20: also the candidate pool) in one launch, from the indexer's
 // wq_b output iqpre and head weights wproj (both made by attention()). Every rank scans everything: the
 // dense scans with index_dense, the Reindex layers' (layer 20's pool) with index_dense_blocks.
+// wide64: a step of more than kDecodeRows rows scans in groups of kDecodeRows rows, in row order (each row's
+// selection is what it is in any call: attn.h).
 void Model::Impl::indexer(int L, int R, int ctx) {
   const int ratio = ratio_of(L), slot = idx_slot(L);
-  const attn::IndexKeys ik = step_keys(kv_slot(kv_source(L)));
-  const attn::IndexSel top{kIdxTopk, topk[slot], topkey[slot], kIdxTopk};
-  if (reindex(L)) {
-    attn::index_dense_blocks(U(iqpre), wproj, pos_d, rope_yarn, R, ratio, ik, pool, kPoolBlocks, keys, kstride, top,
-                             dense_scratch, true, st);
-    return;
+  const attn::IndexKeys ik0 = step_keys(kv_slot(kv_source(L)));
+  for (int r0 = 0; r0 < R; r0 += kDecodeRows) {
+    const int m = std::min(kDecodeRows, R - r0);
+    attn::IndexKeys ik = ik0;
+    if (ik.slot) ik.slot += r0;
+    const attn::IndexSel top{kIdxTopk, topk[slot] + (size_t)r0 * kIdxTopk, topkey[slot] + (size_t)r0 * kIdxTopk, kIdxTopk};
+    const uint16_t* iq = U(iqpre) + (size_t)r0 * kIdxQ;
+    const float* wp = wproj + (size_t)r0 * kIdxHeads;
+    if (reindex(L)) {
+      attn::index_dense_blocks(iq, wp, pos_d + r0, rope_yarn, m, ratio, ik, pool + (size_t)r0 * kPoolBlocks, kPoolBlocks,
+                               keys, kstride, top, dense_scratch, true, st);
+      continue;
+    }
+    const attn::IndexSel ps = L == 20 ? attn::IndexSel{kPoolBlocks, pool + (size_t)r0 * kPoolBlocks,
+                                                       poolkey + (size_t)r0 * kPoolBlocks, kPoolBlocks}
+                                      : attn::IndexSel{};
+    attn::index_dense(iq, wp, pos_d + r0, rope_yarn, m, ratio, ik, ctx / ratio, keys, kstride, bkeys, kstride / 8, top, ps,
+                      dense_scratch, true, st);
   }
-  const attn::IndexSel ps = L == 20 ? attn::IndexSel{kPoolBlocks, pool, poolkey, kPoolBlocks} : attn::IndexSel{};
-  attn::index_dense(U(iqpre), wproj, pos_d, rope_yarn, R, ratio, ik, ctx / ratio, keys, kstride,
-                    bkeys, kstride / 8, top, ps, dense_scratch, true, st);
 }
 
 // A sublayer's mixes, sinkhorn(hc_fn . stream), are needed only by its own hc_post (post, comb) and
@@ -551,7 +569,11 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
   float* pck = reinterpret_cast<float*>(pkv + (size_t)R * kKvPart);
   float* pcs = pck + (size_t)R * kCompPart;
   const dsk::Fp8Seg seg[2] = {{w.wqa, w.sqa, pqa, kQaPart}, {w.wkv, w.skv, pkv, kKvPart}};
-  if (R > dsk::kLowRows && unfused16()) {  // night: 9..16 rows: norm once, then the plain r16 GEMV (same bits)
+  const bool wide = R > kDecodeRows;  // wide64 (docs/wide64.md): the prefill GEMMs
+  if (wide) {
+    dsk::rmsnorm(yraw, w.attn_norm, R, kDim, kNormEps, y, yq, ys, st);
+    dsk::gemm_fp8_p(yq, ys, R, seg, 2, kDim, st);
+  } else if (R > dsk::kLowRows && unfused16()) {  // night: 9..16 rows: norm once, then the plain r16 GEMV (same bits)
     dsk::rmsnorm(yraw, w.attn_norm, R, kDim, kNormEps, y, yq, ys, st);
     dsk::gemv_fp8_multi(yq, ys, R, seg, 2, kDim, c8k, st);  // c8k: the fused call's split-K, same bits
   } else {
@@ -560,7 +582,9 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
   if (dumps) dump(sink, L, "attn_in", pos0, R, y, kDim * 2);
   if (ncomp) {  // this rank's 128 rows of the compressor's wkv (and wgate)
     const attn::CompressorWeights cw{ratio_of(L), U(w.c_wkv), U(w.c_wgate), nullptr, nullptr, nullptr};
-    attn::compressor_project_rows(U(y), cw, 0, kCompPart, pck, pcs, R, true, st);
+    for (int r0 = 0; r0 < R; r0 += kDecodeRows)  // attn's rows per call (wide64: groups)
+      attn::compressor_project_rows(U(y) + (size_t)r0 * kDim, cw, 0, kCompPart, pck + (size_t)r0 * kCompPart,
+                                    pcs + (size_t)r0 * kCompPart, std::min(kDecodeRows, R - r0), true, st);
   }
   if (idx_src(L)) {  // the indexer's head weights need only y
     fork(sb);
@@ -579,11 +603,24 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
   if (ncomp) {
     const int k = kv_slot(L);
     const attn::CompressorWeights cw{ratio_of(L), nullptr, nullptr, U(w.c_norm), U(w.c_wk), U(w.c_knorm)};
-    attn::compressor_emit(ckvf, cscf, pos_d, R, cw, step_carry(k), rope_yarn, step_ckv(k), step_keys(k), nullptr, 0,
-                          sb);
+    // the carry keeps a call's last 16 rows: wide64 steps emit in groups of kDecodeRows rows, in row order (a
+    // session split between two groups is two calls, as two steps)
+    for (int r0 = 0; r0 < R; r0 += kDecodeRows) {
+      attn::CompressorCarry ca = step_carry(k);
+      attn::Compressed cc = step_ckv(k);
+      attn::IndexKeys ck = step_keys(k);
+      if (ca.slot) ca.slot += r0;
+      if (cc.slot) cc.slot += r0;
+      if (ck.slot) ck.slot += r0;
+      attn::compressor_emit(ckvf + (size_t)r0 * kHead, cscf + (size_t)r0 * kHead, pos_d + r0, std::min(kDecodeRows, R - r0),
+                            cw, ca, rope_yarn, cc, ck, nullptr, 0, sb);
+    }
   }
   const dsk::Fp8Seg qseg[2] = {{w.wqb, w.sqb, q, kQ}, {w.ix_wqb, w.ix_sqb, iqpre, kIdxQ}};
-  if (R > dsk::kLowRows && unfused16()) {  // night: wq_b's input normed once (oq/os are free until wo_a)
+  if (wide) {
+    dsk::rmsnorm(qa, w.q_norm, R, kQLora, kNormEps, o, oq, os, st);
+    dsk::gemm_fp8_p(oq, os, R, qseg, idx_src(L) ? 2 : 1, kQLora, st);
+  } else if (R > dsk::kLowRows && unfused16()) {  // night: wq_b's input normed once (oq/os are free until wo_a)
     dsk::rmsnorm(qa, w.q_norm, R, kQLora, kNormEps, o, oq, os, st);  // o: scratch for the bf16 copy
     dsk::gemv_fp8_multi(oq, os, R, qseg, idx_src(L) ? 2 : 1, kQLora, c8k, st);
   } else {
@@ -604,8 +641,14 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
                     attn::AttnScratch{po, pml, kMaxSplits}, st, true);
   // output projections; wo_b is row-parallel: partial sums, all-reduced in fp32 in rank order, then
   // hc_post into mid and the FFN's collapse (by attn_pre) in the same kernel
-  dsk::gemv_woa(o, R, w.woa, w.soa, kOPart, kWoaK, kOGroupRows, nullptr, cwoa, false, st, oq, os);
-  dsk::gemv_fp8(oq, os, R, w.wob, w.sob, kDim, kOPart, part, c8, st);
+  if (wide) {
+    dsk::gemm_woa_p(o, R, w.woa, w.soa, kOPart, kWoaK, kOGroupRows, nullptr, oq, os, st);
+    const dsk::Fp8Seg bseg{w.wob, w.sob, part, kDim};
+    dsk::gemm_fp8_p(oq, os, R, &bseg, 1, kOPart, st);
+  } else {
+    dsk::gemv_woa(o, R, w.woa, w.soa, kOPart, kWoaK, kOGroupRows, nullptr, cwoa, false, st, oq, os);
+    dsk::gemv_fp8(oq, os, R, w.wob, w.sob, kDim, kOPart, part, c8, st);
+  }
   l2pf(4, L, R);
   join(sa);
   ops::allreduce_hc(ch, part, false, R, x, a_post, a_comb, a_pre, mid, yraw, dumps ? sub : nullptr, st);
@@ -656,16 +699,25 @@ void Model::Impl::ffn(int L, int R, bool dumps, Sink* sink, int pos0) {
   }
   // ffn_norm + the router's 384 logits in one launch (CTA 0 also quantises the normed input for the
   // experts); the MoE runs the top-6 selection itself
-  if (R > dsk::kLowRows && unfused16()) {  // night: the gate on the normed rows (y is free after the attention)
+  const bool wide = R > kDecodeRows;
+  if (wide) {  // wide64: the gate as a GEMM, then router_topk and the grouped prefill MoE (one read of the union)
+    dsk::rmsnorm(yraw, w.ffn_norm, R, kDim, kNormEps, y, yq, ys, st);
+    dsk::gemm_bf16_p(y, R, w.gate, kExperts, kDim, gl, st);
+  } else if (R > dsk::kLowRows && unfused16()) {  // night: the gate on the normed rows (y is free after the attention)
     dsk::rmsnorm(yraw, w.ffn_norm, R, kDim, kNormEps, y, yq, ys, st);
     dsk::gemv_bf16(y, R, w.gate, kExperts, kDim, gl, nullptr, cgate, false, st);
   } else {
     dsk::gemv_bf16_norm(yraw, w.ffn_norm, kNormEps, R, w.gate, kExperts, kDim, gl, nullptr, cgate, st, yq, ys);
   }
   if (route_shift) route_rotate<<<R, 128, 0, st>>>(gl, route_shift, route_group);  // bench only
-  dsk::MoeCfg mc{};
-  mc.down = R == 1 ? 2 : 4;
-  dsk::moe_routed(yq, ys, R, gl, w.gate_bias, kExperts, kRouteScale, w.moe, moe_ws, ymoe, mc, st, ridx, rwts);
+  if (wide) {
+    dsk::router_topk(gl, w.gate_bias, R, kExperts, ridx, rwts, kRouteScale, st);
+    dsk::moe_prefill(yq, ys, R, ridx, rwts, kExperts, w.moe, moe_pws, ymoe, st);
+  } else {
+    dsk::MoeCfg mc{};
+    mc.down = R == 1 ? 2 : 4;
+    dsk::moe_routed(yq, ys, R, gl, w.gate_bias, kExperts, kRouteScale, w.moe, moe_ws, ymoe, mc, st, ridx, rwts);
+  }
   if (route_ring) k_route_copy<<<1, 128, 0, st>>>(ridx, in_d, L, route_ring);
   l2pf(1, L + 1, R);
   join(sa);  // the mixes
@@ -914,8 +966,13 @@ void Model::Impl::forward_rows(int R, int ctx, uint32_t flags, Sink* sink, int p
     dump(sink, -1, "final_pre_norm", pos0, R, yraw, kDim * 2);
     dump(sink, -1, "final_hidden", pos0, R, hfin, kDim * 2);
   }
-  if (head_coded) dsk::gemv_bf16x_norm(yraw, norm_w, kNormEps, R, head, kVocabPart, kDim, logits, nullptr, chead, st);
-  else dsk::gemv_bf16_norm(yraw, norm_w, kNormEps, R, head, kVocabPart, kDim, logits, nullptr, chead, st);
+  for (int r0 = 0; r0 < R; r0 += kDecodeRows) {  // wide64: the head GEMVs in groups of kDecodeRows rows
+    const int m = std::min(kDecodeRows, R - r0);
+    const bf16* hin = yraw + (size_t)r0 * kDim;
+    float* lo = logits + (size_t)r0 * kVocabPart;
+    if (head_coded) dsk::gemv_bf16x_norm(hin, norm_w, kNormEps, m, head, kVocabPart, kDim, lo, nullptr, chead, st);
+    else dsk::gemv_bf16_norm(hin, norm_w, kNormEps, m, head, kVocabPart, kDim, lo, nullptr, chead, st);
+  }
   if (flags & kFlagLogits) {
     comm::allgather(ch, logits, lgath, (size_t)R * kVocabPart * 4, st);
     if (lead) {

@@ -576,7 +576,7 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf) {
   sp.draft = std::make_unique<dspark::Draft>(dw, rank, sp.comm.get(), sp.rope, nunits);
   sp.draft->use_slot(cur_unit);
   if (opt.tree_probe) sp.draft->enable_probe();
-  static_assert(kMaxRows <= dspark::kMaxHidden, "a batch spec step's rows fit the draft module's main_hidden tap");
+  static_assert(kDecodeRows <= dspark::kMaxHidden, "a batch spec step's rows fit the draft module's main_hidden tap");
   sp.mh = dalloc<uint16_t>((size_t)kMaxRows * dspark::kMainK);
   sp.ss = dalloc<ops::SpecState>(ops::kMaxSess);  // [0] the one-session step's; B3's entries' [k]
   sp.bents = std::min({ops::kMaxSess, nslots, kMaxSpecEnts});
@@ -763,7 +763,8 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
   // captures N switch bodies only; --bgraph-noif runs the entries' accepts without if nodes (every entry's,
   // on or not: a check of the graph's structure, not of the outputs); --bgraph-check runs every entry's
   // one-session draft after the pass and counts the words that differ (k_spec_draft_check)
-  const int bodies = opt.bgraph_bodies > 0 ? std::min(kMaxRows, opt.bgraph_bodies) : kMaxRows;
+  // wide64: the batch spec step stays within kDecodeRows rows (its wide bodies are a later increment)
+  const int bodies = opt.bgraph_bodies > 0 ? std::min(kDecodeRows, opt.bgraph_bodies) : kDecodeRows;
   const bool noif = opt.bgraph_noif, check = opt.bgraph_check;
   IfHandles hif{}, hchk{};
   hif.n = noif ? 0 : sp.bents;  // a handle per if node, no more: a handle no node uses is an error at instantiate
@@ -1055,7 +1056,7 @@ void Model::Impl::spec_fill_batch(ops::StepIn& in, int mode, const SpecBatch& b)
     in.spos_end[k] = has ? std::min(b.pos_end[k], slot_ctx_[b.slot[k]]) : 0;
     in.sthresh[k] = has ? b.thresh[k] : 0.f;
   }
-  in.rbudget = b.budget > 0 ? std::min(b.budget, kMaxRows) : 0;
+  in.rbudget = b.budget > 0 ? std::min(b.budget, kDecodeRows) : 0;
 }
 
 // The checks a batch spec step needs (every rank passes the same): the entries on, each in a slot of its
@@ -1078,8 +1079,8 @@ int Model::Impl::spec_batch_check(const SpecBatch& b, bool given) {
       die("model: batch spec entry %d: token %d at %d", k, b.token[k], b.pos0[k]);
   }
   if (S < 1) die("model: a batch spec step with no entry on");
-  if (b.budget > 0 ? S > std::min(b.budget, kMaxRows) : rows > kMaxRows)
-    die("model: a batch spec step of %d entries whose next rows could reach %d (kMaxRows %d, budget %d)", S, rows, kMaxRows,
+  if (b.budget > 0 ? S > std::min(b.budget, kDecodeRows) : rows > kDecodeRows)
+    die("model: a batch spec step of %d entries whose next rows could reach %d (kDecodeRows %d, budget %d)", S, rows, kDecodeRows,
         b.budget);
   return S;
 }

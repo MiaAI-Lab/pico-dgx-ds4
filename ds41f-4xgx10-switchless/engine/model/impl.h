@@ -148,6 +148,7 @@ struct Model::Impl {
   uint16_t *keys, *bkeys, *topkey[kIdxSlots], *poolkey;
   int *topk[kIdxSlots], *pool, *ridx;
   void* moe_ws;
+  void* moe_pws = nullptr;  // wide64: moe_prefill's workspace (kMaxRows rows)
 
   // step inputs and results
   ops::StepIn *in_h, *in_d;  // pinned ring [kInSlots] (the host writes), device copy (kernels read)

@@ -17,7 +17,11 @@ constexpr int kVocabPart = kVocab / kRanks;  // 32320 head rows per rank
 // rows (<= kMaxSessRows), or several sessions' runs of consecutive rows (Model::launch_batch) up to 16. The
 // step buffers, the StepIn / SampleOut rings, the sampler's grid and the graphs are sized by it; a graph is
 // captured on first use, so unused row counts cost nothing.
-constexpr int kMaxRows = 16;
+constexpr int kMaxRows = 64;
+// wide64 (docs/wide64.md): steps of 1..kDecodeRows rows run the decode kernels as before (bit for bit); steps of
+// kDecodeRows + 1 .. kMaxRows rows (several sessions' rows, launch_batch) run the wide body: the dense projections as
+// prefill GEMMs, the MoE as moe_prefill, the attention side in groups of kDecodeRows rows.
+constexpr int kDecodeRows = 16;
 constexpr int kMaxSlots = 16;               // session slots (Options::slots): live sessions' states, at most
 // Rows of one session in a step, at most, whatever kMaxRows is: the attention kernels' contract for a
 // step's slot table. attn::decode_prep's fused compressor emit and carry race across CTAs at 16 rows of

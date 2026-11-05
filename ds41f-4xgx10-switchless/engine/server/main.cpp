@@ -1003,8 +1003,8 @@ int main(int argc, char** argv) {
     const int per = a.batch_tf ? a.steps * a.batch_rows : a.steps;  // positions each session goes on by
     if (a.batch_tf && (int)ss.size() * a.batch_rows > model::kMaxRows)
       die("batch: %zu sessions of %d rows a step: at most %d rows", ss.size(), a.batch_rows, model::kMaxRows);
-    if (a.spec && (int)ss.size() > model::kMaxRows / 2)  // B3: a draft each at least
-      die("batch: %zu sessions with drafts (--spec): at most %d (kMaxRows / 2)", ss.size(), model::kMaxRows / 2);
+    if (a.spec && (int)ss.size() > model::kDecodeRows / 2)  // B3: a draft each at least
+      die("batch: %zu sessions with drafts (--spec): at most %d (kDecodeRows / 2)", ss.size(), model::kDecodeRows / 2);
     for (size_t k = 0; k < ss.size(); ++k) {  // each session's prompt in its slot
       Sess& s = ss[k];
       s.slot = a.slots - 1 - (int)k;

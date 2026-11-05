@@ -98,8 +98,12 @@ __device__ __forceinline__ int bin_of(float m, float l) {
   return d < 256.f ? (int)d : 256;
 }
 
-// RB blocks (one per row of the step's at most RB): the instance of kLowRows is the kernel of before B4, launch
-// and bytes alike, the one of kMaxRows serves steps of 9..16 rows.
+// RB rows (the step's at most RB): the instance of kLowRows is the kernel of before B4, launch and bytes alike,
+// the one of kDecodeRows serves steps of 9..16 rows; both a block per row (G = RB). wide64: kMaxRows rows in G = 16
+// blocks (a kernel that waits must have every block resident), block g taking rows g, g + 16, .. in turn, each row
+// by the same arithmetic.
+template <int RB>
+constexpr int sample_grid() { return RB < 16 ? RB : 16; }
 template <int RB>
 __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const float* logits, int vocab0,
                                                      const StepIn* in, const uint32_t* ctl, SampleOut* outs,
@@ -111,29 +115,34 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
   __shared__ float s_gl;
   __shared__ float cv[kCand];
   __shared__ int ci[kCand];
-  __shared__ __align__(16) RowCand all[kRanks];
+  constexpr int G = sample_grid<RB>(), PER = RB / G;
+  __shared__ __align__(16) RowCand all[PER][kRanks];
   __shared__ float uv[kRanks * kCand];
   __shared__ int ui[kRanks * kCand];
   __shared__ uint32_t s_ctl;
 
   wait_prev();
-  const int b = blockIdx.x, t = threadIdx.x;
+  const int t = threadIdx.x;
   const int R = in->rows;
-  const StepSamp sp = in->samp[min(max(b < R ? in->sess[b] : 0, 0), kMaxSess - 1)];  // row b's session's
-  const float T = sp.temperature;
-  const bool greedy = !(T > 0.f);
-  const float invT = greedy ? 1.f : 1.f / T;
-  const bool trunc = !greedy && (sp.top_k > 0 || sp.top_p < 1.f);
-  const int n_top = min(max(sp.n_top, 0), kTopLogprobs);
-  const bool cand = trunc || n_top > 0;
-  const int pos = in->pos[b];
-
   const uint64_t s = comm::next_seq(ch);
   uint8_t* sb = comm::send_buf(ch, s);
-  if (b == 0 && t == 0) {
+  if (blockIdx.x == 0 && t == 0) {
     const uint32_t c = ch.rank == 0 ? *reinterpret_cast<const volatile uint32_t*>(ctl) : 0u;
     *reinterpret_cast<uint4*>(sb) = make_uint4(c, 0, 0, 0);
   }
+#define ROW_PARAMS                                                                                          \
+  const StepSamp sp = in->samp[min(max(b < R ? in->sess[b] : 0, 0), kMaxSess - 1)]; /* row b's session's */ \
+  const float T = sp.temperature;                                                                           \
+  const bool greedy = !(T > 0.f);                                                                           \
+  const float invT = greedy ? 1.f : 1.f / T;                                                                \
+  const bool trunc = !greedy && (sp.top_k > 0 || sp.top_p < 1.f);                                           \
+  const int n_top = min(max(sp.n_top, 0), kTopLogprobs);                                                    \
+  const bool cand = trunc || n_top > 0;                                                                     \
+  const int pos = in->pos[b];                                                                               \
+  (void)n_top, (void)cand, (void)pos, (void)trunc;
+  for (int j = 0; j < PER; ++j) {
+  const int b = blockIdx.x + j * G;
+  ROW_PARAMS
   RowCand* mine = reinterpret_cast<RowCand*>(sb + kHdr) + b;
   if (b < R) {
     const float4* l4 = reinterpret_cast<const float4*>(logits + (size_t)b * kVocabPart);
@@ -236,17 +245,27 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
     mine->gv = -INFINITY, mine->gi = INT_MAX, mine->gl = 0.f;
     mine->t = -INFINITY, mine->n = 0;
   }
+  if (PER > 1) __syncthreads();  // wide64: the block's shared memory serves the next row
+  }
   comm::post_grid(ch, s, kBytes<RB>);
   comm::wait_all(ch, s);
-  if (b < R)
-    for (int k = t; k < kRanks * kChunks; k += kThreads) {
-      const int r = k / kChunks, c = k % kChunks;
-      reinterpret_cast<uint4*>(&all[r])[c] = comm::ld_cv16(comm::src(ch, s, r) + kHdr + (size_t)b * sizeof(RowCand) + 16 * c);
-    }
+  for (int j = 0; j < PER; ++j) {
+    const int b = blockIdx.x + j * G;
+    if (b < R)
+      for (int k = t; k < kRanks * kChunks; k += kThreads) {
+        const int r = k / kChunks, c = k % kChunks;
+        reinterpret_cast<uint4*>(&all[j][r])[c] =
+            comm::ld_cv16(comm::src(ch, s, r) + kHdr + (size_t)b * sizeof(RowCand) + 16 * c);
+      }
+  }
   if (t == 0) s_ctl = comm::ld_cv16(comm::src(ch, s, 0)).x;
   comm::finish_grid(ch, s);  // starts with a barrier: the copies above are done
 
   SampleOut& o = outs[in->step % kOutSlots];
+  for (int j = 0; j < PER; ++j) {
+  const int b = blockIdx.x + j * G;
+  ROW_PARAMS
+  const RowCand* all_ = all[j];
   if (b < R) {
     // the union of the candidates, sorted (thread k: candidate k)
     int nu = 0;
@@ -254,16 +273,16 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
     if (cand) {
       int off[kRanks + 1];
       off[0] = 0;
-      for (int r = 0; r < kRanks; ++r) off[r + 1] = off[r] + all[r].n, tx = fmaxf(tx, all[r].t);
+      for (int r = 0; r < kRanks; ++r) off[r + 1] = off[r] + all_[r].n, tx = fmaxf(tx, all_[r].t);
       nu = off[kRanks];
       if (t < nu) {
         int r = 0;
         while (t >= off[r + 1]) ++r;
-        const float v = all[r].v[t - off[r]];
-        const int id = all[r].id[t - off[r]];
+        const float v = all_[r].v[t - off[r]];
+        const int id = all_[r].id[t - off[r]];
         int rk = 0;
         for (int q = 0; q < kRanks; ++q)
-          for (int j = 0; j < all[q].n; ++j) rk += better(all[q].v[j], all[q].id[j], v, id);
+          for (int j = 0; j < all_[q].n; ++j) rk += better(all_[q].v[j], all_[q].id[j], v, id);
         uv[rk] = v;
         ui[rk] = id;
       }
@@ -273,10 +292,10 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
       float M = -INFINITY;
       int Mi = INT_MAX;
       for (int r = 0; r < kRanks; ++r)
-        if (better(all[r].m, all[r].mi, M, Mi)) M = all[r].m, Mi = all[r].mi;
+        if (better(all_[r].m, all_[r].mi, M, Mi)) M = all_[r].m, Mi = all_[r].mi;
       float Z = 0.f;
       for (int r = 0; r < kRanks; ++r)
-        if (all[r].z > 0.f) Z += all[r].z * expf((all[r].m - M) * invT);
+        if (all_[r].z > 0.f) Z += all_[r].z * expf((all_[r].m - M) * invT);
       const float logZ = M * invT + logf(Z);
       int tok = Mi;
       float val = M, lp = M * invT - logZ;
@@ -285,7 +304,7 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
         float g = -INFINITY, gl = 0.f;
         int gi = INT_MAX;
         for (int r = 0; r < kRanks; ++r)
-          if (better(all[r].gv, all[r].gi, g, gi)) g = all[r].gv, gi = all[r].gi, gl = all[r].gl;
+          if (better(all_[r].gv, all_[r].gi, g, gi)) g = all_[r].gv, gi = all_[r].gi, gl = all_[r].gl;
         tok = gi, val = g, lp = gl * invT - logZ;
         if (trunc) fl |= kSampApprox;
       } else if (trunc) {  // temperature -> top-k -> top-p over the union, one uniform from (seed, position)
@@ -331,6 +350,9 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
       }
     }
   }
+  if (PER > 1) __syncthreads();
+  }
+#undef ROW_PARAMS
   // the last block to finish publishes the step
   __threadfence_system();
   __syncthreads();
@@ -394,11 +416,14 @@ void sample(const comm::DevChannel& ch, const float* logits, int vocab0, const S
   if (max_rows == kLowRows)
     attn::launch(k_sample<kLowRows>, dim3(kLowRows), dim3(kThreads), 0, s, true, ch, logits, vocab0, in, ctl, outs, fb,
                  counter, ss);
+  else if (max_rows == kDecodeRows)
+    attn::launch(k_sample<kDecodeRows>, dim3(kDecodeRows), dim3(kThreads), 0, s, true, ch, logits, vocab0, in, ctl, outs,
+                 fb, counter, ss);
   else if (max_rows == kMaxRows)
-    attn::launch(k_sample<kMaxRows>, dim3(kMaxRows), dim3(kThreads), 0, s, true, ch, logits, vocab0, in, ctl, outs, fb,
-                 counter, ss);
+    attn::launch(k_sample<kMaxRows>, dim3(sample_grid<kMaxRows>()), dim3(kThreads), 0, s, true, ch, logits, vocab0, in, ctl,
+                 outs, fb, counter, ss);
   else
-    die("sample: max_rows %d (kLowRows %d or kMaxRows %d)", max_rows, kLowRows, kMaxRows);
+    die("sample: max_rows %d (%d, %d or %d)", max_rows, kLowRows, kDecodeRows, kMaxRows);
 }
 
 }  // namespace model::ops

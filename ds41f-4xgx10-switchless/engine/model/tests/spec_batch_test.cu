@@ -56,7 +56,7 @@ int main() {
       S += d.sess_on[k];
     }
     if (!S) d.sess_on[rnd() % ns] = 1, S = 1;
-    const int cap = std::min(kDrafts, (kMaxRows - S) / S);
+    const int cap = std::min(kDrafts, (kDecodeRows - S) / S);
     int want_R = 0, row0_ref[kMaxSess] = {};
     for (int k = 0; k < ns; ++k) {
       ss[k].next_rows = 1 + (int)(rnd() % (cap + 1));
