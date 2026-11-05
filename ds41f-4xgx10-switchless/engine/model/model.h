@@ -211,6 +211,8 @@ class Model {
   // spec_batch_mismatches() (Options::bgraph_check): the words of the passes' drafts and confidence that
   // differed from the entries' one-session drafts so far (synchronises).
   int spec_batch_entries() const;
+  // wide64: the rows a batch spec step may reach (kDecodeRows, or DSGB10_WIDE's)
+  int spec_batch_rows() const;
   uint64_t launch_spec_batch(const SpecBatch& b);
   uint64_t launch_verify_batch(const SpecBatch& b);
   unsigned spec_batch_mismatches() const;

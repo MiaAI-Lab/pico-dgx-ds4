@@ -80,7 +80,7 @@ int main() {
       }
     }
     for (int r = R; r < kMaxRows; ++r)
-      check(d.tokens[r] == 0 && d.pos[r] == d.pos[R - 1] && d.slot[r] == d.slot[R - 1] && d.sess[r] == d.sess[R - 1],
+      check(d.tokens[r] == d.tokens[R - 1] && d.pos[r] == d.pos[R - 1] && d.slot[r] == d.slot[R - 1] && d.sess[r] == d.sess[R - 1],
             "layout: the entries past R repeat the last row's", it);
     // B3 phase 2a: the draft passes' compact list and slot tables (k_spec_in_batch, the switch over the entries on)
     int bent[kMaxSess], pstab[kMaxSess * kDrafts];

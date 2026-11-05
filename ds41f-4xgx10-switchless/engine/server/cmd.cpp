@@ -580,9 +580,13 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
     // night T2/T4 (DSGB10_BUDGET=1): every entry may draft up to the rows left after one per entry, and the
     // device's gate keeps the step within kMaxRows by survival across the entries (lossless)
     static const bool budget = getenv("DSGB10_BUDGET") && atoi(getenv("DSGB10_BUDGET")) > 0;
-    const int cap = !S ? 0 : budget ? std::min({kD, c.spec_drafts, model::kDecodeRows - S})
-                                    : std::min({kD, c.spec_drafts, (model::kDecodeRows - S) / S});
-    b.budget = budget ? model::kDecodeRows : 0;
+    // wide64: with DSGB10_WIDE (the model's spec_batch_rows() > 16), steps of at least DSGB10_WIDE_S entries (6) may
+    // reach those rows; fewer entries keep the 16-row steps
+    static const int wide_s = getenv("DSGB10_WIDE_S") ? atoi(getenv("DSGB10_WIDE_S")) : 6;
+    const int rows_cap = S >= wide_s ? m.spec_batch_rows() : model::kDecodeRows;
+    const int cap = !S ? 0 : budget ? std::min({kD, c.spec_drafts, rows_cap - S})
+                                    : std::min({kD, c.spec_drafts, (rows_cap - S) / S});
+    b.budget = budget ? rows_cap : 0;
     b.n = n;
     b.cfg.max_drafts = std::max(0, std::min(kD, c.spec_drafts));
     b.cfg.gate = c.spec_gate;

@@ -100,9 +100,9 @@ __device__ __forceinline__ void kv_write_warp(const uint16_t* src_row, const flo
 
 // one warp per row
 __global__ void kv_write_kernel(const uint16_t* kv_pre, const uint16_t* norm_w, const int* pos, const float2* table,
-                                Window win, uint16_t* kv_out, int rows) {
+                                Window win, uint16_t* kv_out, int rows, const int* nrows) {
   int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31;
-  if (row >= rows) return;
+  if (row >= rows || (nrows && row >= *nrows)) return;
   float nw[16];
 #pragma unroll
   for (int j = 0; j < 16; ++j) nw[j] = bf2f(norm_w[lane * 16 + j]);
@@ -214,9 +214,9 @@ void q_norm(const uint16_t* qa, const uint16_t* w, uint16_t* qr, int rows, cudaS
 }
 
 void kv_write(const uint16_t* kv_pre, const uint16_t* norm_w, const int* pos, const float2* table, Window win,
-              uint16_t* kv_out, int rows, cudaStream_t s) {
+              uint16_t* kv_out, int rows, cudaStream_t s, const int* nrows) {
   check_slots(win, "kv_write");
-  kv_write_kernel<<<(rows + 3) / 4, 128, 0, s>>>(kv_pre, norm_w, pos, table, win, kv_out, rows);
+  kv_write_kernel<<<(rows + 3) / 4, 128, 0, s>>>(kv_pre, norm_w, pos, table, win, kv_out, rows, nrows);
   CUDA_CHECK(cudaGetLastError());
 }
 

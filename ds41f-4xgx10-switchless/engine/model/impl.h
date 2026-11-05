@@ -260,7 +260,8 @@ struct Model::Impl {
   void engram_prepare(int pos0, int R, const uint64_t seq[2]);
   void engram_submit(int R, const uint64_t seq[2]);  // the store's requests for the rows' ids
   // a batch step's rows: each one's token into its slot's history, then its session's hashes
-  void engram_rows(int R, const int32_t* tok, const int32_t* pos, const int32_t* slot, const uint64_t seq[2]);
+  void engram_rows(int R, const int32_t* tok, const int32_t* pos, const int32_t* slot, const uint64_t seq[2],
+                   int pad_to = 0);
   void engram_apply(int L, int R);
   void project(const bf16* stream, int L, int h, int R);
   void attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink* sink, int pos0);

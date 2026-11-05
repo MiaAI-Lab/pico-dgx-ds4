@@ -24,6 +24,18 @@ using namespace detail;
 
 namespace detail {
 
+// wide64 (docs/wide64.md): DSGB10_WIDE=W (kDecodeRows < W <= kMaxRows) lets batch spec steps reach W rows through the
+// wide bodies; unset or <= kDecodeRows: the steps stay within kDecodeRows (the build of before wide64).
+int spec_wide_rows() {
+  static const int w = [] {
+    const char* e = getenv("DSGB10_WIDE");
+    int v = e ? atoi(e) : 0;
+    return v > kDecodeRows ? std::min(v, kMaxRows) : 0;
+  }();
+  return w;
+}
+int spec_row_cap() { return spec_wide_rows() ? spec_wide_rows() : kDecodeRows; }
+
 namespace {
 
 constexpr int kSegs = dspark::kMaxGatherSegs;
@@ -150,7 +162,7 @@ __global__ void k_spec_in_batch(const ops::StepIn* ring, uint32_t* counter, cons
       for (int j = 0; j < dspark::kMaxAcc; ++j) stab[k * dspark::kMaxAcc + j] = d->sess_slot[k];
     const int S = ops::spec_batch_passes(*d, bent, pstab);
     *counter += 1;
-    cudaGraphSetConditional(hsw, (unsigned)(d->rows - 1));
+    cudaGraphSetConditional(hsw, (unsigned)ops::spec_body(d->rows));  // wide64: a bucket's body past kDecodeRows
     for (int k = 0; k < hif.n; ++k) cudaGraphSetConditional(hif.h[k], d->sess_on[k] ? 1u : 0u);
     cudaGraphSetConditional(hpass, (unsigned)(S - 1));
     for (int k = 0; k < hchk.n; ++k) cudaGraphSetConditional(hchk.h[k], d->sess_on[k] ? 1u : 0u);
@@ -579,7 +591,7 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf) {
   static_assert(kDecodeRows <= dspark::kMaxHidden, "a batch spec step's rows fit the draft module's main_hidden tap");
   sp.mh = dalloc<uint16_t>((size_t)kMaxRows * dspark::kMainK);
   sp.ss = dalloc<ops::SpecState>(ops::kMaxSess);  // [0] the one-session step's; B3's entries' [k]
-  sp.bents = std::min({ops::kMaxSess, nslots, kMaxSpecEnts});
+  sp.bents = std::min({ops::kMaxSess, nslots, spec_wide_rows() ? ops::kMaxSess : kMaxSpecEnts});  // wide64: 16
   sp.row0 = dalloc<int>(ops::kMaxSess);
   sp.stab = dalloc<int>((size_t)ops::kMaxSess * dspark::kMaxAcc);
   // B3 phase 2a: the draft passes over the entries (spec_batch_passes' list and tables, the draft module's
@@ -763,8 +775,10 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
   // captures N switch bodies only; --bgraph-noif runs the entries' accepts without if nodes (every entry's,
   // on or not: a check of the graph's structure, not of the outputs); --bgraph-check runs every entry's
   // one-session draft after the pass and counts the words that differ (k_spec_draft_check)
-  // wide64: the batch spec step stays within kDecodeRows rows (its wide bodies are a later increment)
-  const int bodies = opt.bgraph_bodies > 0 ? std::min(kDecodeRows, opt.bgraph_bodies) : kDecodeRows;
+  // wide64 (DSGB10_WIDE=W, W > kDecodeRows): after the bodies of 1..16 rows, one per wide bucket up to W rows
+  const int wide = spec_wide_rows();
+  const int nwide = wide > kDecodeRows ? ops::spec_body(wide) - kDecodeRows + 1 : 0;
+  const int bodies = opt.bgraph_bodies > 0 ? std::min(kDecodeRows, opt.bgraph_bodies) : kDecodeRows + nwide;
   const bool noif = opt.bgraph_noif, check = opt.bgraph_check;
   IfHandles hif{}, hchk{};
   hif.n = noif ? 0 : sp.bents;  // a handle per if node, no more: a handle no node uses is an error at instantiate
@@ -791,21 +805,23 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
   cudaGraphNode_t sw;
   CUDA_CHECK(cudaGraphAddNode(&sw, g, head.data(), nullptr, head.size(), &cp));
   mh_on = true;
-  for (int R = 1; R <= bodies; ++R) {
-    CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, cp.conditional.phGraph_out[R - 1], nullptr, nullptr, 0, mode));
+  for (int b = 0; b < bodies; ++b) {  // body b: b + 1 rows, or a wide bucket's rows (pad rows past the step's)
+    const int R = b < kDecodeRows ? b + 1 : ops::wide_bucket_rows(b - kDecodeRows);
+    CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, cp.conditional.phGraph_out[b], nullptr, nullptr, 0, mode));
     forward_rows(R, ctx, 0, nullptr, 0);
+    // the verdicts, per entry: the sampler's grid by the body's rows (16 rows: the launch of before wide64)
+    ops::sample(ch, logits, kVocabPart * rank, in_d, ctl_h, out_h, fb, samp_ctr, st, sp.ss,
+                R > kDecodeRows ? kMaxRows : kDecodeRows);
     CUDA_CHECK(cudaStreamEndCapture(st, &cap));
   }
   mh_on = false;
   size_t nodes = 0;
-  for (int R = 1; R <= bodies; ++R) {
+  for (int b = 0; b < bodies; ++b) {
     size_t k = 0;
-    CUDA_CHECK(cudaGraphGetNodes(cp.conditional.phGraph_out[R - 1], nullptr, &k));
+    CUDA_CHECK(cudaGraphGetNodes(cp.conditional.phGraph_out[b], nullptr, &k));
     nodes += k;
   }
-  // the verdicts, per entry
   CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, &sw, nullptr, 1, mode));
-  ops::sample(ch, logits, kVocabPart * rank, in_d, ctl_h, out_h, fb, samp_ctr, st, sp.ss);
   CUDA_CHECK(cudaStreamGetCaptureInfo(st, &cs, nullptr, nullptr, &deps, nullptr, &nd));
   std::vector<cudaGraphNode_t> tail(deps, deps + nd);
   CUDA_CHECK(cudaStreamEndCapture(st, &cap));
@@ -1056,7 +1072,7 @@ void Model::Impl::spec_fill_batch(ops::StepIn& in, int mode, const SpecBatch& b)
     in.spos_end[k] = has ? std::min(b.pos_end[k], slot_ctx_[b.slot[k]]) : 0;
     in.sthresh[k] = has ? b.thresh[k] : 0.f;
   }
-  in.rbudget = b.budget > 0 ? std::min(b.budget, kDecodeRows) : 0;
+  in.rbudget = b.budget > 0 ? std::min(b.budget, spec_row_cap()) : 0;
 }
 
 // The checks a batch spec step needs (every rank passes the same): the entries on, each in a slot of its
@@ -1079,8 +1095,8 @@ int Model::Impl::spec_batch_check(const SpecBatch& b, bool given) {
       die("model: batch spec entry %d: token %d at %d", k, b.token[k], b.pos0[k]);
   }
   if (S < 1) die("model: a batch spec step with no entry on");
-  if (b.budget > 0 ? S > std::min(b.budget, kDecodeRows) : rows > kDecodeRows)
-    die("model: a batch spec step of %d entries whose next rows could reach %d (kDecodeRows %d, budget %d)", S, rows, kDecodeRows,
+  if (b.budget > 0 ? S > std::min(b.budget, spec_row_cap()) : rows > spec_row_cap())
+    die("model: a batch spec step of %d entries whose next rows could reach %d (cap %d, budget %d)", S, rows, spec_row_cap(),
         b.budget);
   return S;
 }
@@ -1162,6 +1178,7 @@ uint64_t Model::Impl::launch_verify_batch(const SpecBatch& b) {
 
 void Model::bind_spec(dsw::WeightFile& wf) { d_->bind_spec(wf); }
 int Model::spec_batch_entries() const { return d_->spec ? d_->spec->bents : 0; }
+int Model::spec_batch_rows() const { return detail::spec_row_cap(); }
 unsigned Model::spec_batch_mismatches() const {
   if (!d_->spec || !d_->spec->mism) return 0;
   unsigned n = 0;

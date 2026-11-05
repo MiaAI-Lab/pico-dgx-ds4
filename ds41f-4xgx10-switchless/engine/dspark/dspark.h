@@ -26,7 +26,7 @@ namespace dspark {
 inline constexpr int kBlocks = 3;   // mtp.0 .. mtp.2
 inline constexpr int kDraft = 5;    // block rows = drafts per pass (dspark_block_size)
 inline constexpr int kMaxAcc = 8;   // positions per accept() call
-inline constexpr int kMaxHidden = 16;  // rows of a main_hidden buffer, at most: a batch spec step's (docs/batching.md, B3)
+inline constexpr int kMaxHidden = 64;  // rows of a main_hidden buffer, at most: a batch spec step's (B3; wide64: 64)
 // A batch spec step's draft pass over several entries (Draft::draft_batch, docs/batching.md B3 phase 2a): a pass
 // takes at most kBatchEnts entries, kDraft rows each, within the kernels' 16 rows (dsk::kMaxRows,
 // attn::kMaxDecodeRows); kMaxEnts entries keep an anchor and results (the runner's ops::kMaxSess).

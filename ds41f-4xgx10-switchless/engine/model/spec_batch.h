@@ -6,6 +6,24 @@
 
 namespace model::ops {
 
+// wide64 (docs/wide64.md): a batch spec step of R > kDecodeRows rows runs the switch body of the smallest bucket
+// that holds it, its rows past R pad rows (copies of row R - 1, masked from every state write). Bodies 0 .. 15: R
+// rows exactly; 16 + i: kWideBuckets[i] rows.
+constexpr int kNumWideBuckets = 8;
+__host__ __device__ inline int wide_bucket_rows(int i) {
+  const int b[kNumWideBuckets] = {20, 24, 28, 32, 40, 48, 56, 64};
+  return b[i];
+}
+__host__ __device__ inline int spec_body(int R) {  // the switch body of a step of R rows
+  if (R <= kDecodeRows) return R - 1;
+  int i = 0;
+  while (i < kNumWideBuckets - 1 && wide_bucket_rows(i) < R) ++i;
+  return kDecodeRows + i;
+}
+__host__ __device__ inline int spec_body_rows(int R) {  // the rows that body runs
+  return R <= kDecodeRows ? R : wide_bucket_rows(spec_body(R) - kDecodeRows);
+}
+
 // A batch verify step's rows from the entries' spec states: the entries on (sess_on), in entry order,
 // each its next_rows rows (its bonus token, then its drafts) at next_pos0 .., with its slot (sess_slot)
 // and its entry index in sess[]; the entries past R repeat the last row's (tokens 0); row0[k] entry k's
@@ -29,8 +47,8 @@ __host__ __device__ inline int spec_batch_layout(StepIn& d, const SpecState* ss,
   for (int k = ns; k < kMaxSess; ++k) row0[k] = 0;
   if (R < 1) R = 1;  // never: the host launches with an entry on
   d.rows = R;
-  for (int r = R; r < kMaxRows; ++r) {  // the entries past R repeat the last row's
-    d.tokens[r] = 0;
+  for (int r = R; r < kMaxRows; ++r) {  // the entries past R repeat the last row's (wide64: its token too, so that a
+    d.tokens[r] = d.tokens[R - 1];      // wide bucket's pad rows compute row R - 1's values and add no experts)
     d.pos[r] = d.pos[R - 1], d.slot[r] = d.slot[R - 1], d.sess[r] = d.sess[R - 1];
   }
   return R;

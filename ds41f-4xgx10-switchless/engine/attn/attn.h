@@ -68,8 +68,9 @@ void rope_rows(uint16_t* x, int rows, int heads, int dim, const int* pos, const 
                bool inverse, cudaStream_t s);
 // The window KV of `rows` new tokens: kv_norm(wkv output) -> RoPE at pos -> fp8 per 32 with a
 // power-of-two scale -> ring slot pos & (kRing-1). Optionally also returns the dequantised bf16.
+// nrows (device, optional): rows r >= *nrows write nothing (wide64: a bucket's pad rows).
 void kv_write(const uint16_t* kv_pre, const uint16_t* norm_w, const int* pos, const float2* table,
-              Window win, uint16_t* kv_out_or_null, int rows, cudaStream_t s);
+              Window win, uint16_t* kv_out_or_null, int rows, cudaStream_t s, const int* nrows = nullptr);
 
 // y[r][n] = x[r] . W[n] for bf16 x [rows][K] and bf16 W [N][K] (rows n < N0 from W0 into y0 [rows][N0],
 // the rest from W1 into y1 [rows][N-N0]), fp32 out; round_bf16 rounds to bf16 values (a bf16 F.linear).
@@ -99,9 +100,12 @@ void compressor_project(const uint16_t* x, const CompressorWeights& w, float* kv
 // == 0): pool (ratio 2), RMSNorm, then the index key (wk, k_norm, RoPE at entry*ratio, fp4/e8m0) and the
 // KV entry (RoPE at entry*ratio, fp4/e4m3). Then records the rows' projections in the carry.
 // Tests can pass debug_latent to get each entry's normalised latent (pre-RoPE) at [entry - debug_base].
+// nrows (device, optional): rows r >= *nrows - row_base emit and carry nothing (wide64: a bucket's pad rows; row_base:
+// this call's first row in the step).
 void compressor_emit(const float* kv, const float* score, const int* pos, int rows, const CompressorWeights& w,
                      CompressorCarry carry, const float2* table, Compressed ckv, IndexKeys ik,
-                     uint16_t* debug_latent, int debug_base, cudaStream_t s);
+                     uint16_t* debug_latent, int debug_base, cudaStream_t s, const int* nrows = nullptr,
+                     int row_base = 0);
 
 // ---- indexer ------------------------------------------------------------------------------------
 // Full layers (2, 8, 14, 20) score every compressed position a row can see; layer 20 also picks the

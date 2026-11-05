@@ -14,6 +14,7 @@
 #include "model/prefill.h"
 #include "model/spec.h"
 #include "model/state.h"
+#include "model/spec_batch.h"
 
 namespace model {
 
@@ -465,7 +466,8 @@ void Model::Impl::engram_prepare(int pos0, int R, const uint64_t seq[2]) {
   engram_submit(R, seq);
 }
 
-void Model::Impl::engram_rows(int R, const int32_t* tok, const int32_t* pos, const int32_t* slot, const uint64_t seq[2]) {
+void Model::Impl::engram_rows(int R, const int32_t* tok, const int32_t* pos, const int32_t* slot, const uint64_t seq[2],
+                              int pad_to) {
   for (int r = 0; r < R; ++r) {
     std::vector<int32_t>& h = hist_of(slot[r]);
     if ((int)h.size() < pos[r]) die("model: slot %d's history ends at %zu, a row at %d", slot[r], h.size(), pos[r]);
@@ -477,7 +479,12 @@ void Model::Impl::engram_rows(int R, const int32_t* tok, const int32_t* pos, con
     engram::hash_positions(*emap, hist_of(slot[r0]).data(), nullptr, pos[r0], r1 - r0,
                            ids.data() + (size_t)r0 * 2 * kEngramCols);
   }
-  engram_submit(R, seq);
+  // wide64: a wide bucket's pad rows look up row R - 1's n-grams again, so that the gathered segments and offsets
+  // are the bucket's (the captured body's engram_seg) and the pad rows compute row R - 1's values
+  for (int r = R; r < pad_to; ++r)
+    std::copy(ids.begin() + (size_t)(R - 1) * 2 * kEngramCols, ids.begin() + (size_t)R * 2 * kEngramCols,
+              ids.begin() + (size_t)r * 2 * kEngramCols);
+  engram_submit(std::max(R, pad_to), seq);
 }
 
 void Model::Impl::engram_submit(int R, const uint64_t seq[2]) {
@@ -599,7 +606,7 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
   const float2* tab = L < 2 ? rope_plain : rope_yarn;
   const attn::Window win = step_win(L);
   fork(sb);
-  attn::kv_write(U(kvx), U(w.kv_norm), pos_d, tab, win, nullptr, R, sb);
+  attn::kv_write(U(kvx), U(w.kv_norm), pos_d, tab, win, nullptr, R, sb, R > kDecodeRows ? &in_d->rows : nullptr);
   if (ncomp) {
     const int k = kv_slot(L);
     const attn::CompressorWeights cw{ratio_of(L), nullptr, nullptr, U(w.c_norm), U(w.c_wk), U(w.c_knorm)};
@@ -613,7 +620,7 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
       if (cc.slot) cc.slot += r0;
       if (ck.slot) ck.slot += r0;
       attn::compressor_emit(ckvf + (size_t)r0 * kHead, cscf + (size_t)r0 * kHead, pos_d + r0, std::min(kDecodeRows, R - r0),
-                            cw, ca, rope_yarn, cc, ck, nullptr, 0, sb);
+                            cw, ca, rope_yarn, cc, ck, nullptr, 0, sb, R > kDecodeRows ? &in_d->rows : nullptr, r0);
     }
   }
   const dsk::Fp8Seg qseg[2] = {{w.wqb, w.sqb, q, kQ}, {w.ix_wqb, w.ix_sqb, iqpre, kIdxQ}};
@@ -891,7 +898,7 @@ void Model::Impl::engram_late_rows(int R, const int32_t* tok, const int32_t* pos
   if (n_steps >= 2) wait_done(n_steps - 2);  // the step before it has read the Engram buffers
   int32_t u[kMaxRows];  // the server's slots -> units
   for (int r = 0; r < R; ++r) u[r] = unit_of[slot[r]];
-  engram_rows(R, tok, pos, u, late.seq);
+  engram_rows(R, tok, pos, u, late.seq, ops::spec_body_rows(R));  // wide64: the bucket's rows
   late.on = false;
 }
 

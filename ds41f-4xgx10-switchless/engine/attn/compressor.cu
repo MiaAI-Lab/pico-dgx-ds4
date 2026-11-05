@@ -11,14 +11,18 @@ namespace {
 // One 128-thread CTA per row (compressor.cuh emit_row), into the row's session's state.
 __global__ void __launch_bounds__(128) emit_kernel(const float* kv, const float* score, const int* pos, int rows,
                                                    CompressorWeights w, CompressorCarry carry, const float2* table,
-                                                   Compressed ckv, IndexKeys ik, uint16_t* dbg_latent, int dbg_base) {
+                                                   Compressed ckv, IndexKeys ik, uint16_t* dbg_latent, int dbg_base,
+                                                   const int* nrows, int row_base) {
   const int r = blockIdx.x;
+  if (nrows && r >= *nrows - row_base) return;  // wide64: a pad row
   emit_row(r, r > 0 && same_session(carry.slot, r - 1, r), kv, score, pos, w, carry_at(carry, r), table, ckv_at(ckv, r),
            ik_at(ik, r), dbg_latent, dbg_base);
 }
 
 // keep the last (up to) 16 rows' ratio-2 projections, by position
-__global__ void carry_kernel(const float* kv, const float* score, const int* pos, int rows, CompressorCarry carry) {
+__global__ void carry_kernel(const float* kv, const float* score, const int* pos, int rows, CompressorCarry carry,
+                             const int* nrows, int row_base) {
+  if (nrows) rows = min(rows, *nrows - row_base);  // wide64: the real rows only (the last 16 of them)
   int r = rows - 1 - blockIdx.x;
   if (r < 0) return;
   carry_row(r, kv, score, pos, carry_at(carry, r));
@@ -33,16 +37,17 @@ void compressor_project(const uint16_t* x, const CompressorWeights& w, float* kv
 
 void compressor_emit(const float* kv, const float* score, const int* pos, int rows, const CompressorWeights& w,
                      CompressorCarry carry, const float2* table, Compressed ckv, IndexKeys ik,
-                     uint16_t* debug_latent, int debug_base, cudaStream_t s) {
+                     uint16_t* debug_latent, int debug_base, cudaStream_t s, const int* nrows, int row_base) {
   // the carry keeps a call's last 16 rows, so with session slots every row (no two rows of a session on one slot)
   if (carry.slot && rows > 16) die("compressor_emit: %d rows with session slots", rows);
   check_slots(carry, "compressor_emit");
   check_slots(ckv, "compressor_emit");
   check_slots(ik, "compressor_emit");
-  emit_kernel<<<rows, 128, 0, s>>>(kv, score, pos, rows, w, carry, table, ckv, ik, debug_latent, debug_base);
+  emit_kernel<<<rows, 128, 0, s>>>(kv, score, pos, rows, w, carry, table, ckv, ik, debug_latent, debug_base, nrows,
+                                   row_base);
   CUDA_CHECK(cudaGetLastError());
   if (w.ratio > 1) {
-    carry_kernel<<<rows < 16 ? rows : 16, 128, 0, s>>>(kv, score, pos, rows, carry);
+    carry_kernel<<<rows < 16 ? rows : 16, 128, 0, s>>>(kv, score, pos, rows, carry, nrows, row_base);
     CUDA_CHECK(cudaGetLastError());
   }
 }
