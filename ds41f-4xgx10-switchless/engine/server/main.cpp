@@ -1048,6 +1048,15 @@ int main(int argc, char** argv) {
         s.hash = (s.hash ^ bits) * 1099511628211ull;
       });
       bcast(ring, Cmd{});  // stop
+      if (const char* dp = getenv("DSGB10_TF_DUMP")) {  // wide64 test: every session's samples, one line each
+        FILE* f = std::fopen(dp, "w");
+        for (size_t k = 0; f && k < ss.size(); ++k) {
+          std::fprintf(f, "%zu %d", k, ss[k].ctx);
+          for (int32_t t : ss[k].out) std::fprintf(f, " %d", t);
+          std::fprintf(f, "\n");
+        }
+        if (f) std::fclose(f);
+      }
       for (size_t k = 0; k < ss.size(); ++k) {
         const Sess& s = ss[k];
         int same = 0;
