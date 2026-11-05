@@ -9,7 +9,7 @@
 // (mix_ranks; here hc_finish), the FFN's by a one-block collective that spins for as long as the
 // engine's (mix_allreduce; here a stand-in).
 //
-//   bench_chain [--rows R (1..16)] [--experts U] [--routes FILE [--windows N]] [--scales L] [--head NPY]
+//   bench_chain [--rows R (1..64; past 16: --experts U, variants wide/wmoe/wdense/hgemm)] [--experts U] [--routes FILE [--windows N]] [--scales L] [--head NPY]
 //               [--rounds N] [--variants a,b,...] [--ar-us 14] [--arf-us 18] [--ag-us 18] [--mix-us 49.5]
 //               [--prefer-shared (cudaFuncCachePreferShared, device-wide)]
 //
@@ -49,7 +49,8 @@
 namespace dsk {  // kernel names as kprof.py shortens them (dsk::<unnamed>::)
 namespace {
 
-constexpr int kL = 40, kD = 5120, kCopies = 4, kPool = 96, kMR = dsk::kMaxRows;  // kMR: buffers' rows
+constexpr int kL = 40, kD = 5120, kCopies = 4, kPool = 128, kMR = 64;  // kMR: buffers' rows (wide64: up to 64)
+constexpr int kG = dsk::kMaxRows;  // the decode kernels' rows per call
 constexpr int kQaPart = 320, kKvPart = 128, kCompPart = 128, kQ = 8192, kQLora = 1280, kIdxQ = 4096;
 constexpr int kOPart = 2048, kWoaK = 4096, kOGroup = 1024, kExperts = 384, kGatePart = 96, kVocabPart = 32320;
 constexpr int kEngN = 6400, kEngK = 6144, kHcDim = 4 * kD;
@@ -213,6 +214,10 @@ struct Var {
   bool head1 = false;     // the head on one row (its cost at R rows against one)
   bool raw = false;       // with --scales: the MoE on the raw scales, not their code
   bool head_raw = false;  // with --head: the raw head, not the coded one
+  // wide64 (rows > 16): wide = the dense projections as prefill GEMMs (gemm_fp8_p / gemm_woa_p / gemm_bf16_p after
+  // one rmsnorm) and the MoE as moe_prefill; without it the decode GEMVs and MoE run in chunks of 16 rows. wmoe /
+  // wdense: only the MoE / only the dense side wide. hgemm: the head as a GEMM on the raw head (else coded r16 chunks)
+  bool wide_moe = false, wide_dense = false, hgemm = false;
   // pf: a paced L2 prefetch on a side stream (k_l2pf) of what the next weight kernels read: 1 at the FFN's
   // all-reduce (the next layer's wq_a + wkv, then its wq_b and the indexer's wq), 2 at the attention's all-reduce
   // (the router gate), 4 at the attention (wo_a), 8 at the attention's all-gather (what 1 left of wq_b and the
@@ -275,6 +280,10 @@ Var make_var(const std::string& n) {
     else if (f == "h1") v.head1 = true;
     else if (f == "raw") v.raw = true;
     else if (f == "hraw") v.head_raw = true;
+    else if (f == "wide") v.wide_moe = v.wide_dense = true;
+    else if (f == "wmoe") v.wide_moe = true;
+    else if (f == "wdense") v.wide_dense = true;
+    else if (f == "hgemm") v.hgemm = true;
     else if (f == "pf") v.pf |= 3;
     else if (f == "pfq") v.pf |= 1;
     else if (f == "pfg") v.pf |= 2;
@@ -364,6 +373,8 @@ void run(const Opts& o) {
                  : R == 1  ? 6
                  : R <= 8  ? 27
                            : std::min(kPool, (int)std::lround(kExperts * (1 - std::pow(1 - 6.0 / kExperts, R))));
+  if (R > kG && !o.experts && o.routes.empty()) die("bench_chain: rows %d > %d needs --experts U or --routes", R, kG);
+  if (R > kG && o.experts > kPool) die("bench_chain: --experts %d > pool %d", o.experts, kPool);
   // ---- weights
   auto fp8 = [&](size_t n, size_t k, uint8_t*& w, uint8_t*& s, uint32_t seed) {
     w = dev_fill(n * k, seed), s = dev_fill(n / 32 * (k / 32), seed + 1, 118, 16);
@@ -490,6 +501,11 @@ void run(const Opts& o) {
         *post = dev_zero<float>(kMR * 4), *comb = dev_zero<float>(kMR * 16);
   CUDA_CHECK(cudaMemset(hpart, 0x3c, kMR * 25 * 4));
   uint8_t* ws = dev_zero<uint8_t>(dsk::moe_workspace_bytes());
+  uint8_t* pws = R > kG ? dev_zero<uint8_t>(dsk::moe_prefill_workspace_bytes(R, kExperts)) : nullptr;
+  int* ridx = dev_zero<int>(kMR * 6);
+  float* rwts = dev_zero<float>(kMR * 6);
+  __nv_bfloat16* qn = dev_zero<__nv_bfloat16>(kMR * kQLora);  // wide: q_norm's output
+  uint8_t *qq = dev_zero<uint8_t>(kMR * kQLora), *qs = dev_zero<uint8_t>(kMR * kQLora / 32);
   // logits that make the MoE pick nu fresh experts per layer from the pool (the gate's own output is
   // computed but not used: its weights are random), or a route window's: each layer's distinct experts on
   // the pool slots after the previous layer's. Window w's logits are in lwin; a round copies its own to lsel.
@@ -556,7 +572,33 @@ void run(const Opts& o) {
       if (v.standins) dsk::launch_pdl(k, dim3(blocks), dim3(threads), 0, st, true, (uint32_t)(us * 1000));
     };
     const float ar_us = o.ar_us + 1.2f * (R - 1), arf_us = o.arf_us + 5.1f * (R - 1),
-                mix_us = o.mix_us - 1.6f * (R - 1);
+                mix_us = std::max(10.f, o.mix_us - 1.6f * (std::min(R, kG) - 1));
+    const int ngrp = (R + kG - 1) / kG;  // wide64: the attention and indexer in groups of 16 rows
+    // wide64 helpers: a normed FP8 projection (x [R][K] bf16, norm nw) into segs; an FP8 one from (xq, xs)
+    auto normed_fp8 = [&](const __nv_bfloat16* xin, const __nv_bfloat16* nw, const dsk::Fp8Seg* sg, int nseg, int K,
+                          dsk::GemvCfg c, __nv_bfloat16* yout, __nv_bfloat16* nscratch, uint8_t* sq, uint8_t* ss) {
+      if (R <= kG) return dsk::gemv_fp8_norm(xin, nw, 1e-20f, R, sg, nseg, K, c, st, yout);
+      if (v.wide_dense) {
+        dsk::rmsnorm(xin, nw, R, K, 1e-20f, yout ? yout : nscratch, sq, ss, st);
+        return dsk::gemm_fp8_p(sq, ss, R, sg, nseg, K, st);
+      }
+      for (int r0 = 0; r0 < R; r0 += kG) {
+        dsk::Fp8Seg cs[dsk::kMaxSegs];
+        for (int i = 0; i < nseg; ++i) cs[i] = sg[i], cs[i].y = sg[i].y + (size_t)r0 * sg[i].N;
+        dsk::gemv_fp8_norm(xin + (size_t)r0 * K, nw, 1e-20f, std::min(kG, R - r0), cs, nseg, K, c, st,
+                           yout ? yout + (size_t)r0 * K : nullptr);
+      }
+    };
+    auto plain_fp8 = [&](const uint8_t* xq, const uint8_t* xs, const uint8_t* W, const uint8_t* S, int N, int K,
+                         __nv_bfloat16* yo, dsk::GemvCfg c) {
+      if (R > kG && v.wide_dense) {
+        const dsk::Fp8Seg sg{W, S, yo, N};
+        return dsk::gemm_fp8_p(xq, xs, R, &sg, 1, K, st);
+      }
+      for (int r0 = 0; r0 < R; r0 += kG)
+        dsk::gemv_fp8(xq + (size_t)r0 * K, xs + (size_t)r0 * K / 32, std::min(kG, R - r0), W, S, N, K, yo + (size_t)r0 * N,
+                      c, st);
+    };
     // a pf prefetch on sc, from the main stream's last kernel on: these weights (and scales) in order, from `skip`
     // bytes into them, up to `cap` bytes (the variant's budget); the bytes it takes
     const size_t budget = v.pf_kb ? (size_t)v.pf_kb << 10 : ~(size_t)0;
@@ -649,13 +691,13 @@ void run(const Opts& o) {
       const Layer& d = Ls[L % kCopies];
       if (engram(L)) {  // store rows all-gathered, wkv, the partial dots all-gathered
         standin(k_allgather_standin, 4, 256, o.eng_us);
-        dsk::gemv_fp8(eq, es, R, ewkv[L == 14], eskv[L == 14], kEngN, kEngK, ekv, v.ceng, st);
+        plain_fp8(eq, es, ewkv[L == 14], eskv[L == 14], kEngN, kEngK, ekv, v.ceng);
         standin(k_allgather_standin, 4, 256, o.eng_us);
       }
       // ---- attention
       project(2 * L);
       const dsk::Fp8Seg seg[2] = {{d.wqa, d.sqa, qa, kQaPart}, {d.wkv, d.skv, kvx, kKvPart}};
-      dsk::gemv_fp8_norm(yraw, d.n_attn, 1e-20f, R, seg, 2, kD, v.cqa, st, y);
+      normed_fp8(yraw, d.n_attn, seg, 2, kD, v.cqa, y, nullptr, yq, ys);
       if (kv_src(L)) {
         const attn::CompressorWeights cw{L < 20 ? 2 : 1, U(d.cwkv), U(d.cwg), nullptr, nullptr, nullptr};
         for (int r0 = 0; r0 < R; r0 += attn::kMaxDecodeRows)  // attn's rows per call
@@ -682,18 +724,26 @@ void run(const Opts& o) {
         attn::hc_finish(hpart, R, hc_sc, hc_base, pre, post, comb, sa);
       }
       const dsk::Fp8Seg qseg[2] = {{d.wqb, d.sqb, q, kQ}, {d.wix, d.six, iq, kIdxQ}};
-      dsk::gemv_fp8_norm(qa, d.n_q, 1e-20f, R, qseg, idx_src(L) ? 2 : 1, kQLora, v.cqb, st);
+      normed_fp8(qa, d.n_q, qseg, idx_src(L) ? 2 : 1, kQLora, v.cqb, nullptr, qn, qq, qs);
       if (v.pf & 4) l2pf({{d.woa, (size_t)kOPart * kWoaK}, {d.soa, (size_t)kOPart * kWoaK / sc32}});
       window(3, L, o.attn_us + o.comb_us + (idx_src(L) ? o.idx_us : 0));
       xwin(3, L);
       if (idx_src(L)) {
         join(sb);
-        standin(k_index_fused_standin, 40, 256, o.idx_us);
+        for (int g = 0; g < ngrp; ++g) standin(k_index_fused_standin, 40, 256, o.idx_us);
       }
-      standin(k_attn_kernel_standin, 2 + (L < 2 ? 0 : 8), 256, o.attn_us);
-      standin(k_attn_combine_standin, R, 256, o.comb_us);
-      dsk::gemv_woa(ao, R, d.woa, d.soa, kOPart, kWoaK, kOGroup, nullptr, v.cwoa, false, st, oq, os);
-      dsk::gemv_fp8(oq, os, R, d.wob, d.sob, kD, kOPart, part, v.cob, st);
+      for (int g = 0; g < ngrp; ++g) {
+        standin(k_attn_kernel_standin, 2 + (L < 2 ? 0 : 8), 256, o.attn_us);
+        standin(k_attn_combine_standin, std::min(kG, R - g * kG), 256, o.comb_us);
+      }
+      if (R > kG && v.wide_dense) {
+        dsk::gemm_woa_p(ao, R, d.woa, d.soa, kOPart, kWoaK, kOGroup, nullptr, oq, os, st);
+      } else {
+        for (int r0 = 0; r0 < R; r0 += kG)
+          dsk::gemv_woa(ao + (size_t)r0 * 16 * 512, std::min(kG, R - r0), d.woa, d.soa, kOPart, kWoaK, kOGroup, nullptr,
+                        v.cwoa, false, st, oq + (size_t)r0 * kOPart, os + (size_t)r0 * kOPart / 32);
+      }
+      plain_fp8(oq, os, d.wob, d.sob, kD, kOPart, part, v.cob);
       if (v.pf & 2) l2pf({{d.gate, (size_t)kExperts * kD * 2}});
       window(4, L, ar_us);
       xwin(4, L);
@@ -706,6 +756,14 @@ void run(const Opts& o) {
       if (v.gate_split) {
         dsk::gemv_bf16_norm(yraw, d.n_ffn, 1e-20f, R, d.gate, kGatePart, kD, gl, nullptr, v.cgate, st, yq, ys);
         standin(k_allgather_standin, 4, 256, o.ag_us);
+      } else if (R > kG && v.wide_dense) {
+        dsk::rmsnorm(yraw, d.n_ffn, R, kD, 1e-20f, y, yq, ys, st);
+        dsk::gemm_bf16_p(y, R, d.gate, kExperts, kD, gl, st);
+      } else if (R > kG) {
+        dsk::rmsnorm(yraw, d.n_ffn, R, kD, 1e-20f, y, yq, ys, st);
+        for (int r0 = 0; r0 < R; r0 += kG)
+          dsk::gemv_bf16(y + (size_t)r0 * kD, std::min(kG, R - r0), d.gate, kExperts, kD, gl + (size_t)r0 * kExperts,
+                         nullptr, v.cgate, false, st);
       } else {
         dsk::gemv_bf16_norm(yraw, d.n_ffn, 1e-20f, R, d.gate, kExperts, kD, gl, nullptr, v.cgate, st, yq, ys);
       }
@@ -715,7 +773,18 @@ void run(const Opts& o) {
       if (v.moe_up >= 0) mc.up = mc.up16 = v.moe_up;
       if (v.moe_down >= 0) mc.down = mc.down16 = v.moe_down;
       const dsk::MoeWeights& mw = o.scales >= 0 && !v.raw ? MWc[L % kCopies] : MW[L % kCopies];
-      dsk::moe_routed(yq, ys, R, lsel + (size_t)L * kMR * kExperts, bias, kExperts, 1.5f, mw, ws, ymoe, mc, st);
+      const float* lg = lsel + (size_t)L * kMR * kExperts;
+      if (R > kG && v.wide_moe) {
+        dsk::router_topk(lg, bias, R, kExperts, ridx, rwts, 1.5f, st);
+        dsk::moe_prefill(yq, ys, R, ridx, rwts, kExperts, mw, pws, ymoe, st);
+      } else {
+        for (int r0 = 0; r0 < R; r0 += kG) {
+          const int m = std::min(kG, R - r0);
+          mc.down = m == 1 ? 2 : 4;
+          dsk::moe_routed(yq + (size_t)r0 * kD, ys + (size_t)r0 * kD / 32, m, lg + (size_t)r0 * kExperts, bias, kExperts,
+                          1.5f, mw, ws, ymoe + (size_t)r0 * kD, mc, st);
+        }
+      }
       if ((v.pf & 1) && L + 1 < kL) {
         const Layer& e = Ls[(L + 1) % kCopies];
         const size_t ix = idx_src(L + 1) ? (size_t)kIdxQ * kQLora : 0;
@@ -729,7 +798,20 @@ void run(const Opts& o) {
       standin(k_allreduce_hc_standin, 40, 288, arf_us);
     }
     if (v.pf || !v.pf_w.empty() || v.pf_x) join(sc);
-    if (v.head_sep) {
+    if (R > kG && v.hgemm) {
+      dsk::rmsnorm(yraw, n_out, R, kD, 1e-20f, y, nullptr, nullptr, st);
+      dsk::gemm_bf16_p(y, R, head, kVocabPart, kD, logits, st);
+    } else if (R > kG) {
+      for (int r0 = 0; r0 < R; r0 += kG) {
+        const int m = std::min(kG, R - r0);
+        if (headx && !v.head_raw)
+          dsk::gemv_bf16x_norm(yraw + (size_t)r0 * kD, n_out, 1e-20f, m, headx, kVocabPart, kD,
+                               logits + (size_t)r0 * kVocabPart, nullptr, v.chead, st);
+        else
+          dsk::gemv_bf16_norm(yraw + (size_t)r0 * kD, n_out, 1e-20f, m, head, kVocabPart, kD,
+                              logits + (size_t)r0 * kVocabPart, nullptr, v.chead, st);
+      }
+    } else if (v.head_sep) {
       dsk::rmsnorm(yraw, n_out, R, kD, 1e-20f, y, nullptr, nullptr, st);
       dsk::gemv_bf16(y, R, head, kVocabPart, kD, logits, nullptr, v.chead, false, st);
     } else if (headx && !v.head_raw) {
@@ -829,7 +911,7 @@ int main(int argc, char** argv) {
       }
     } else die("bench_chain: unknown argument %s", a.c_str());
   }
-  if (o.rows < 1 || o.rows > dsk::kMaxRows) die("bench_chain: rows %d", o.rows);
+  if (o.rows < 1 || o.rows > kMR) die("bench_chain: rows %d (1..%d)", o.rows, kMR);
   if (o.windows < 1 || (!o.routes.empty() && o.experts)) die("bench_chain: --windows %d, or --routes with --experts", o.windows);
   run(o);
   return 0;
