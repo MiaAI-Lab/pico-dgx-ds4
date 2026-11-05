@@ -426,6 +426,9 @@ __device__ __forceinline__ void select_bins(const SelectArgs& a, int r, int lo, 
     if (bmax) {  // the blocks that reach the bin, in order (each holds a candidate, so at most cap)
       const int nb = (n + 7) / 8;
       uint32_t nl = 0;
+      __shared__ uint32_t nlow;  // listed blocks below 65536: blist is ascending, so they are its prefix
+      if (tid == 0) nlow = 0;
+      __syncthreads();
       for (int base = 0; base < nb; base += kSelChunk) {
         const int b0 = base + tid * kSelPer;
         uint32_t m[16], sel = 0;
@@ -434,14 +437,18 @@ __device__ __forceinline__ void select_bins(const SelectArgs& a, int r, int lo, 
         for (int j = 0; j < 16; ++j) sel |= (uint32_t)(m[j] && (m[j] >> 5) >= bin) << j;
         uint32_t tot, o = nl + block_excl_scan(__popc(sel), tmp, &tot);
         for (uint32_t t = sel; t; t &= t - 1)
-          if (o < (uint32_t)cap) blist[o++] = (uint16_t)(b0 + __ffs(t) - 1);
+          if (o < (uint32_t)cap) {
+            const uint32_t blk = b0 + __ffs(t) - 1;
+            if (blk < 65536u) atomicAdd(&nlow, 1u);
+            blist[o++] = (uint16_t)(blk & 0xFFFFu);
+          }
         nl += tot;
       }
       __syncthreads();
       nl = min(nl, (uint32_t)cap);
       for (uint32_t base = 0; base < nl; base += kSelThreads) {  // a thread: a listed block's keys
         const uint32_t i = base + tid;
-        const int i0 = i < nl ? blist[i] * 8 : 0;
+        const int i0 = i < nl ? (int)((blist[i] | (i >= nlow ? 0x10000u : 0u)) * 8) : 0;
         uint32_t k[8] = {}, c = 0;
         if (i < nl) {
           load8<kL2>(row, i0, k);
@@ -979,7 +986,7 @@ void index_dense(const uint16_t* iq_pre, const float* wproj, const int* pos, con
                  IndexSel top, IndexSel pool, uint32_t* scratch, bool pdl, cudaStream_t s, int cand) {
   int padded = (max_scan + kScorePos - 1) / kScorePos * kScorePos;
   if (rows < 1 || rows > kMaxDecodeRows || keys_stride < padded || !bkeys || bkeys_stride < padded / 8 ||
-      bkeys_stride > 65536)  // select_bins lists blocks by 16-bit index
+      bkeys_stride > 131072)  // select_bins lists blocks by 16-bit index plus a prefix split (17 bits)
     die("index_dense: %d rows, strides %d/%d for %d", rows, keys_stride, bkeys_stride, max_scan);
   const int sms = dense_sms();
   const IndexScan whole{};
