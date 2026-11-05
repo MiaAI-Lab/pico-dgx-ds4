@@ -1,6 +1,6 @@
 # wide64: a drafted batch step of up to 64 rows
 
-Status: design + increment 1 (bench model) on branch `wide64`. Production stays on
+Status: design, increment 1 (bench model) and increment 2 (wide `launch_batch` body, 4-rank verified) on branch `wide64`. Production stays on
 cb61118 + `DSGB10_BUDGET=1 DSGB10_OEA=4,12,9` until a wide build passes every gate.
 
 ## Why
@@ -33,13 +33,32 @@ gains most, and the dense GEMMs matter only once the MoE is wide. Marginal cost 
 ~1.2 ms per row (24 -> 64 rows, union growth included) against ~3.6 ms per row in 16-row decode steps.
 The live engine runs ~10 % above bench_chain at 16 rows (64 vs 58 ms).
 
-### What that buys (estimate, not measured end to end)
+### Measured on the engine (increment 2, 4 ranks, real weights, 2026-11-05)
+
+`--mode batch --batch-tf` (8 sessions at 1-4.6K, teacher-forced) and `--mode bench --bench-groups` (ctx 4K,
+natural routing; "rotated" = each session's routing shifted, the worst case for the union):
+
+| rows | batch-tf ms (8 sess) | bench natural ms | experts/layer | bench rotated ms | ms per row (natural) |
+|---|---|---|---|---|---|
+| 16 (decode path) | 61.8 | 57.2-64.1 | 47-52 | 64.6-81.7 | 3.6-4.0 |
+| 32 (wide) | 98.3 | 96.7-104.3 | 76-79 | 112.9-128.5 | 3.0-3.3 |
+| 48 (wide) | 119.6 | 116.5-122.0 | 94-99 | 151.2-159.4 | 2.4-2.5 |
+| 64 (wide) | 139.1 | 143.0 | 112 | 189.1 | 2.2 |
+
+The engine runs 10-15 % above the bench_chain model (real collectives and attention). Correctness: each
+session's samples are identical across 32-, 48- and 64-row steps (row results do not depend on the batch);
+against the 16-row decode path 35 of 768 teacher-forced argmaxes differ (ulp-level drift flipping near-ties
+on this synthetic code/doc text), golden-next-token matches 444 vs 446 of 768. qeval at c4/c16 is still the
+gate once serve can reach the wide path.
+
+### What that buys (estimate from the measured step times, not yet measured end to end)
 
 | load | today | wide step | step ms (est.) | tokens/step (est.) | tok/s (est.) |
 |---|---|---|---|---|---|
-| 8 agent sessions | 16 rows, 14.8 tok, ~64 ms + host | 8 x (1 + 5) = 48 rows, U ~80 | ~110 + draft ~6 | ~32-36 | ~280-310 (live 215) |
-| code16 | 16 rows, 16 tok, ~54 ms | 16 x 3 = 48 rows, U ~87 | ~117 + draft | ~40 | ~300-340 without a wide drafter pass; ~330-370 with OEA (live 296) |
+| 8 agent sessions | 16 rows, 14.8 tok, ~64 ms + host | 8 x 4 = 32 rows (measured 98 ms) | ~98 + draft ~12 | ~27-29 | ~245-265 (live 215) |
+| code16 | 16 rows, 16 tok, ~54 ms (OEA) | 16 x 3 = 48 rows (measured 117-122 ms) | ~120 + draft ~23 | ~38-42 | ~270-300: no gain over live 296 without OEA on the wide MoE and a one-pass drafter |
 
+Revised after the engine numbers: the wide step alone is a modest win for agent load and none for code16.
 Code16 >= 400 needs both the wide drafter pass (one pass over 16 entries instead of 6 serial 3-entry
 passes, ~23 ms today at 16 entries) and OEA on the wide MoE; it is not guaranteed by these numbers. Agent
 load is the clearer win (more drafts per session at high acceptance). c1 never takes the wide path.
