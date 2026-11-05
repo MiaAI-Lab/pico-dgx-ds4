@@ -117,7 +117,7 @@ __global__ void __launch_bounds__(kDim / 8) draft_prep_batch_kernel(const int* e
 // entry, block q's warps rows kDraft q .., the same arithmetic per row.
 template <bool BATCH>
 __global__ void __launch_bounds__(32 * kDraft) router3_kernel(const float* logits, const float* bias, int* idx,
-                                                              float* wts) {
+                                                              float* wts, bool zdup) {
   pdl_trigger();
   const int r = (BATCH ? blockIdx.x * kDraft : 0) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
   float b[4];
@@ -158,7 +158,8 @@ __global__ void __launch_bounds__(32 * kDraft) router3_kernel(const float* logit
   if (lane < kTopKPad) {
     const int k = lane % kTopK;
     idx[r * kTopKPad + lane] = ids[k];
-    wts[r * kTopKPad + lane] = __fmul_rn(__fdiv_rn(picked[k], sum), kRouteScale);
+    // zdup (the wide pass's moe_prefill counts every pick): the repeats weigh 0, adding +0 to each row's sum
+    wts[r * kTopKPad + lane] = zdup && lane >= kTopK ? 0.f : __fmul_rn(__fdiv_rn(picked[k], sum), kRouteScale);
   }
 }
 
@@ -185,7 +186,7 @@ __global__ void __launch_bounds__(256) markov_kernel(int j, const int* ids, cons
   pdl_trigger();
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int g = blockIdx.x * 8 + warp;
-  const int q = BATCH ? blockIdx.y : 0, jr = BATCH ? q * kDraft + j : j, cs = BATCH ? 4 : 1;
+  const int q = BATCH ? blockIdx.y : 0, jr = BATCH ? q * kDraft + j : j, cs = BATCH ? kCandStride : 1;
   if constexpr (BATCH) {
     ids += 8 * ent[q];
     cta += q * kMarkovCtas;
@@ -296,7 +297,7 @@ __global__ void __launch_bounds__(32 * kDraft) conf_kernel(const uint16_t* hx, c
   pdl_trigger();
   pdl_wait();
   const int j = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  const int q = BATCH ? blockIdx.x : 0, jr = BATCH ? q * kDraft + j : j, cs = BATCH ? 4 : 1;
+  const int q = BATCH ? blockIdx.x : 0, jr = BATCH ? q * kDraft + j : j, cs = BATCH ? kCandStride : 1;
   if constexpr (BATCH) {
     const int e = ent[q];
     ids += 8 * e;
@@ -790,6 +791,7 @@ struct Draft::Buf {
   float *bso, *bsml, *blg_r, *blg, *bwts, *bymoe, *blogits, *bdl;
   int* bidx;
   void* bmoe_ws;
+  void* bpws;  // wide64: moe_prefill's workspace (the wide pass)
   Cand *bcta, *bcand, *bgcand;
   unsigned* bcounter;
 };
@@ -980,7 +982,7 @@ void Draft::draft(const int* token, cudaStream_t s, const int* slot) {
       comm_->all_gather(&gl, 1, s);  // COLLECTIVE: all-gather of the router logits
     }
     launch(router3_kernel<false>, dim3(1), dim3(32 * kDraft), 0, s, true, (const float*)b.lg, w.gate_bias, b.idx,
-           b.wts);
+           b.wts, false);
     tap(taps.route_idx[i], b.idx, kDraft * kTopKPad * 4, s);
     tap(taps.route_w[i], b.wts, kDraft * kTopKPad * 4, s);
     dsk::moe(b.xq, b.xs, kDraft, b.idx, b.wts, w.moe, b.moe_ws, b.ymoe, mc, s);
@@ -1032,7 +1034,8 @@ void Draft::enable_batch() {
     p = reinterpret_cast<std::remove_reference_t<decltype(p)>>(base ? base + off : nullptr);
     off += bytes;
   };
-  constexpr size_t R = kBatchRows, E = kBatchEnts, C = kDraft * 4;  // C: the candidates of a pass, [kDraft][4]
+  // wide64: sized for the one-pass drafter's kWideRows rows of kWideEnts entries; C: a pass's candidates [kDraft][16]
+  constexpr size_t R = kWideRows, E = kWideEnts, C = kDraft * kCandStride;
   for (int pass = 0; pass < 2; ++pass) {
     off = 0;
     take(b.bstart, kMaxEnts * 4), take(b.bids, kMaxEnts * 8 * 4), take(b.bconf, kMaxEnts * 16 * 4);
@@ -1050,6 +1053,7 @@ void Draft::enable_batch() {
     take(b.bhx, R * kDim * 2), take(b.bhxn, R * kDim * 2), take(b.blogits, R * kVocabRank * 4), take(b.bdl, R * kVocabRank * 4);
     take(b.bemb, R * kMarkov * 2), take(b.bcta, E * kMarkovCtas * sizeof(Cand)), take(b.bcand, C * sizeof(Cand));
     take(b.bgcand, C * sizeof(Cand)), take(b.bcounter, E * 4);
+    take(b.bpws, dsk::moe_prefill_workspace_bytes(kWideRows, kExperts));
     if (pass == 0) {
       CUDA_CHECK(cudaMalloc(&b.batch_arena, off));
       CUDA_CHECK(cudaMemset(b.batch_arena, 0, off));
@@ -1089,8 +1093,9 @@ void Draft::bmix(const uint16_t* x, int rows, const float* fn, const float* fn_a
 void Draft::draft_batch(const BatchPass& p, cudaStream_t s) {
   Buf& b = *b_;
   if (!b.batch_arena) die("dspark::Draft: draft_batch() before enable_batch()");
-  if (p.n < 1 || p.n > kBatchEnts || !p.ent || !p.tok || p.tok_stride < 1 || !p.slot)
-    die("dspark::Draft: draft_batch of %d entries (1..%d, with tokens and a slot table)", p.n, kBatchEnts);
+  if (p.n < 1 || p.n > kWideEnts || !p.ent || !p.tok || p.tok_stride < 1 || !p.slot)
+    die("dspark::Draft: draft_batch of %d entries (1..%d, with tokens and a slot table)", p.n, kWideEnts);
+  if (p.n > kBatchEnts) return draft_batch_wide(p, s);
   const int R = kDraft * p.n;
   // draft()'s configs: the same k order, split-K slices and folds per output
   dsk::GemvCfg c8k{1, 1, 8}, cqb{2, 1, 8}, cob{2, 1, 16}, cw{1, 4, 4}, cg{1, 1, 8}, ch{2, 1, 16}, ch8{2, 1, 8};
@@ -1129,23 +1134,36 @@ void Draft::draft_batch(const BatchPass& p, cudaStream_t s) {
       comm_->all_gather(&gl, 1, s);  // COLLECTIVE: all-gather of the router logits
     }
     launch(router3_kernel<true>, dim3(p.n), dim3(32 * kDraft), 0, s, true, (const float*)b.blg, w.gate_bias, b.bidx,
-           b.bwts);
+           b.bwts, false);
     dsk::moe(b.bxq, b.bxs, R, b.bidx, b.bwts, w.moe, b.bmoe_ws, b.bymoe, mc, s);
     comm_->all_reduce(b.bymoe, true, b.bsub, (size_t)R * kDim, s);  // COLLECTIVE: all-reduce of the MoE's partial
     attn::hc_post(b.bsub, b.bxb, b.bpost, b.bcomb, R, b.bxa, s, true);
   }
-  // ---- head: hc_pre with the last pre-mix, norm, the vocab slice; each entry's Markov chain; the confidence head
+  draft_batch_head(p, R, s);
+}
+
+// The head of a pass (either kind): hc_pre with the last pre-mix, norm, the vocab slice; each entry's Markov chain;
+// the confidence head.
+void Draft::draft_batch_head(const BatchPass& p, int R, cudaStream_t s) {
+  Buf& b = *b_;
+  dsk::GemvCfg ch{2, 1, 16}, ch8{2, 1, 8};
   attn::hc_pre(b.bxa, b.bpre, R, w_.norm, b.bhxn, b.bhx, s, true);
   if (w_.head4) {  // at most 8 rows a call: each entry's 5, draft()'s call
     for (int q = 0; q < p.n; ++q)
       dsk::gemv_fp4w_f32(bf(b.bhxn) + (size_t)q * kDraft * kDim, kDraft, w_.head4, w_.head4_s, vrows_, kDim,
                          b.blogits + (size_t)q * kDraft * kVocabRank, ch8, s);
-  } else if (w_.head8) {
-    dsk::gemv_fp8w_f32(bf(b.bhxn), R, w_.head8, w_.head8_s, vrows_, kDim, b.blogits, ch8, s);
-  } else if (w_.head_coded) {
-    dsk::gemv_bf16x(bf(b.bhxn), R, w_.head_coded, kVocabRank, kDim, b.blogits, nullptr, ch, s);
+  } else if (w_.head8 && R > kBatchRows && vrows_ == kVocabRank) {
+    // wide64: the FP8 head as one GEMM over every entry's rows (the head read once, not once per 3 entries)
+    dsk::gemm_fp8w_f32_p(bf(b.bhxn), R, w_.head8, w_.head8_s, kVocabRank, kDim, b.blogits, s);
   } else {
-    dsk::gemv_bf16(bf(b.bhxn), R, w_.head, kVocabRank, kDim, b.blogits, nullptr, ch, false, s);
+    for (int r0 = 0; r0 < R; r0 += kBatchRows) {  // calls of at most 3 entries (the GEMVs' 16 rows)
+      const int m = std::min(kBatchRows, R - r0);
+      const __nv_bfloat16* hx = bf(b.bhxn) + (size_t)r0 * kDim;
+      float* lo = b.blogits + (size_t)r0 * kVocabRank;
+      if (w_.head8) dsk::gemv_fp8w_f32(hx, m, w_.head8, w_.head8_s, vrows_, kDim, lo, ch8, s);
+      else if (w_.head_coded) dsk::gemv_bf16x(hx, m, w_.head_coded, kVocabRank, kDim, lo, nullptr, ch, s);
+      else dsk::gemv_bf16(hx, m, w_.head, kVocabRank, kDim, lo, nullptr, ch, false, s);
+    }
   }
   const int ncand = (p.n + 1) & ~1;  // the pass's candidates per step, an even count (argmax_rows's 16 bytes)
   for (int j = 0; j < kDraft; ++j) {
@@ -1153,10 +1171,83 @@ void Draft::draft_batch(const BatchPass& p, cudaStream_t s) {
            s, true, j, (const int*)b.bids, (const Cand*)b.bgcand, (const int*)nullptr, w_.markov_embed,
            w_.markov8 ? w_.markov8 : w_.markov_head, w_.markov8_s, (const float*)b.blogits, b.bdl, (float*)nullptr,
            b.bemb, b.bcta, b.bcand, b.bcounter, kVocabRank * rank_, p.ent);
-    comm_->argmax_rows(b.bcand + j * 4, b.bgcand + j * 4, ncand, s);  // COLLECTIVE: the entries' argmaxes
+    comm_->argmax_rows(b.bcand + j * kCandStride, b.bgcand + j * kCandStride, ncand, s);  // COLLECTIVE
   }
   launch(conf_kernel<true>, dim3(p.n), dim3(32 * kDraft), 0, s, true, (const uint16_t*)b.bhx, (const uint16_t*)b.bemb,
          w_.conf, (const Cand*)b.bgcand, b.bids, b.bconf, p.ent);
+}
+
+// wide64, the one-pass drafter: every entry's rows in one pass (up to kWideEnts entries, kWideRows rows), the dense
+// projections as prefill GEMMs and the MoE as moe_prefill, so each weight is read once for all the entries instead of
+// once per 3. decode_prep runs in calls of 3 entries (its 16 rows); everything else takes the pass's rows at once.
+// Each row is still its own (no cross-row sums), within ~1 ulp of the 15-row pass: the drafts may differ, the
+// tokens of a spec decode cannot (the target verifies every one).
+void Draft::draft_batch_wide(const BatchPass& p, cudaStream_t s) {
+  Buf& b = *b_;
+  const int R = kDraft * p.n;
+  dsk::GemvCfg c8k{1, 1, 8}, cqb{2, 1, 8}, cob{2, 1, 16}, cw{1, 4, 4}, cg{1, 1, 8};
+  c8k.tiled = cqb.tiled = cob.tiled = true;
+  // DSGB10_DRAFT1_GEMM=0: wq_b, wo_a and wo_b as the narrow pass's GEMV calls too (only the MoE and head wide)
+  static const bool gemm = !getenv("DSGB10_DRAFT1_GEMM") || atoi(getenv("DSGB10_DRAFT1_GEMM")) != 0;
+  launch(draft_prep_batch_kernel, dim3(kDraft, p.n), dim3(kDim / 8), 0, s, true, p.ent, p.tok, p.tok_stride,
+         (const int*)b.bstart, w_.embed, b.bxa, b.bpos, b.blo, b.bhi, b.bpre, b.bids);
+  for (int i = 0; i < kBlocks; ++i) {
+    const BlockW& w = w_.b[i];
+    bmix(b.bxa, R, w.attn_fn, w.attn_fn_all, w.attn_scale, w.attn_base, w.attn_norm, s);
+    for (int r0 = 0; r0 < R; r0 += kBatchRows) {  // small matrices: the narrow pass's GEMV calls (its bits)
+      const int m = std::min(kBatchRows, R - r0);
+      const dsk::Fp8Seg seg[2] = {{w.wq_a, w.wq_a_s, bf(b.bqa_r) + (size_t)r0 * 320, 320},
+                                  {w.wkv, w.wkv_s, bf(b.bkvp_r) + (size_t)r0 * 128, 128}};
+      dsk::gemv_fp8_multi(b.bxq + (size_t)r0 * kDim, b.bxs + (size_t)r0 * (kDim / 32), m, seg, 2, kDim, c8k, s);
+    }
+    const GatherSeg g[2] = {{b.bqa_r, 320 * 2, b.bqa, kQLora * 2, 320 * 2, R},
+                            {b.bkvp_r, 128 * 2, b.bkvp, 512 * 2, 128 * 2, R}};
+    comm_->all_gather(g, 2, s);  // COLLECTIVE: all-gather of wq_a's and wkv's outputs
+    for (int r0 = 0; r0 < R; r0 += kBatchRows) {
+      const int m = std::min(kBatchRows, R - r0);
+      attn::DecodePrep a;
+      a.pos = b.bpos + r0, a.table = table_, a.qa = b.bqa + (size_t)r0 * kQLora, a.q_norm = w.q_norm;
+      a.qq = b.bqq + (size_t)r0 * kQLora, a.qs = b.bqs + (size_t)r0 * (kQLora / 32);
+      a.kv_pre = b.bkvp + (size_t)r0 * 512, a.kv_norm = w.kv_norm, a.win = win(i, p.slot + r0);
+      attn::decode_prep(a, m, true, s);
+    }
+    if (gemm) {
+      const dsk::Fp8Seg qb{w.wq_b, w.wq_b_s, bf(b.bqb), 8192};
+      dsk::gemm_fp8_p(b.bqq, b.bqs, R, &qb, 1, kQLora, s);
+    } else {
+      for (int r0 = 0; r0 < R; r0 += kBatchRows)
+        dsk::gemv_fp8(b.bqq + (size_t)r0 * kQLora, b.bqs + (size_t)r0 * (kQLora / 32), std::min(kBatchRows, R - r0),
+                      w.wq_b, w.wq_b_s, 8192, kQLora, bf(b.bqb) + (size_t)r0 * 8192, cqb, s);
+    }
+    attn::sparse_attn(b.bqb, b.bpos, {b.blo, b.bhi}, R, table_, win(i, p.slot), attn::Compressed{}, nullptr, 0, w.sink,
+                      b.bo, kSplits, {b.bso, b.bsml, kSplits}, s, true);
+    if (gemm) {
+      dsk::gemm_woa_p(bf(b.bo), R, w.wo_a, w.wo_a_s, 2048, 4096, 1024, nullptr, b.boq, b.bos, s);
+      const dsk::Fp8Seg ob{w.wo_b, w.wo_b_s, bf(b.bpart), kDim};
+      dsk::gemm_fp8_p(b.boq, b.bos, R, &ob, 1, 2048, s);
+    } else {
+      for (int r0 = 0; r0 < R; r0 += kBatchRows) {
+        const int m = std::min(kBatchRows, R - r0);
+        dsk::gemv_woa(bf(b.bo) + (size_t)r0 * 8192, m, w.wo_a, w.wo_a_s, 2048, 4096, 1024, nullptr, cw, false, s,
+                      b.boq + (size_t)r0 * 2048, b.bos + (size_t)r0 * (2048 / 32));
+        dsk::gemv_fp8(b.boq + (size_t)r0 * 2048, b.bos + (size_t)r0 * (2048 / 32), m, w.wo_b, w.wo_b_s, kDim, 2048,
+                      bf(b.bpart) + (size_t)r0 * kDim, cob, s);
+      }
+    }
+    comm_->all_reduce(b.bpart, false, b.bsub, (size_t)R * kDim, s);  // COLLECTIVE: all-reduce of wo_b's partial
+    attn::hc_post(b.bsub, b.bxa, b.bpost, b.bcomb, R, b.bxb, s, true);
+    bmix(b.bxb, R, w.ffn_fn, w.ffn_fn_all, w.ffn_scale, w.ffn_base, w.ffn_norm, s);
+    if (!w.gate_all) die("dspark::Draft: the wide pass needs the whole router (gate_all)");
+    for (int r0 = 0; r0 < R; r0 += kBatchRows)  // 1.3 MB: the narrow pass's GEMV calls
+      dsk::gemv_bf16(bf(b.by) + (size_t)r0 * kDim, std::min(kBatchRows, R - r0), w.gate_all, kExperts, kDim,
+                     b.blg + (size_t)r0 * kExperts, nullptr, cg, false, s);
+    launch(router3_kernel<true>, dim3(p.n), dim3(32 * kDraft), 0, s, true, (const float*)b.blg, w.gate_bias, b.bidx,
+           b.bwts, true);
+    dsk::moe_prefill(b.bxq, b.bxs, R, b.bidx, b.bwts, kExperts, w.moe, b.bpws, b.bymoe, s);
+    comm_->all_reduce(b.bymoe, true, b.bsub, (size_t)R * kDim, s);  // COLLECTIVE: all-reduce of the MoE's partial
+    attn::hc_post(b.bsub, b.bxb, b.bpost, b.bcomb, R, b.bxa, s, true);
+  }
+  draft_batch_head(p, R, s);
 }
 
 // ---- EXPERIMENT, bench only: the probe --------------------------------------------------------------------------

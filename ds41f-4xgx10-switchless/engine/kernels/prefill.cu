@@ -1582,6 +1582,14 @@ void gemm_woa_p(const __nv_bfloat16* x, int M, const uint8_t* W, const uint8_t* 
   else launch_gemm16<64, 64, 32, 32, 4, true>(a, st);
 }
 
+void gemm_fp8w_f32_p(const __nv_bfloat16* x, int M, const uint8_t* W, const uint8_t* S, int N, int K, float* y,
+                     cudaStream_t st) {
+  if (M < 1 || K % 64 || N % 64) die("gemm_fp8w_f32_p: M=%d N=%d K=%d", M, N, K);
+  G16Args a{x, K, M, K, W, S, N, N, y, nullptr, nullptr, nullptr};
+  // one M tile of 128 rows: W read once
+  launch_gemm16<128, 64, 64, 32, 3, true>(a, st);
+}
+
 void prefill_tuning(const PrefillTuning& t) { g_tune = t; }
 
 size_t moe_prefill_workspace_bytes(int M, int E) { return carve(nullptr, M, E).bytes; }

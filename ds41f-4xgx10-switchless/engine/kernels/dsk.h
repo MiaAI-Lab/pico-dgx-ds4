@@ -145,6 +145,10 @@ void gemv_bf16x(const __nv_bfloat16* x, int M, const uint8_t* X, int N, int K, f
                 cudaStream_t st);
 void gemv_bf16x_norm(const __nv_bfloat16* x, const __nv_bfloat16* norm_w, float eps, int M, const uint8_t* X, int N, int K,
                      float* yf, __nv_bfloat16* yb, GemvCfg cfg, cudaStream_t st);
+// wide64, the coded-head GEMM: gemv_bf16x_norm (coded) / gemv_bf16_norm over M <= 64 rows, fp32 out, the weights read
+// once for every group of 16 rows; the bits of calls of 16 rows in row order (M <= 16: that call).
+void gemv_bf16_norm_rows(const __nv_bfloat16* x, const __nv_bfloat16* norm_w, float eps, int M, const uint8_t* W,
+                         bool coded, int N, int K, float* yf, GemvCfg cfg, cudaStream_t st);
 // wo_a: FP8 W [N][K] with [N/32][K/32] scales, widened to bf16 (exact; block scales <= 2^7);
 // block-diagonal: rows [g*group_rows, (g+1)*group_rows) read x[:, g*K:(g+1)*K]. x [M][N/group_rows*K].
 // With q/qs also act_quant(y) (wo_b's input; y may then be null); needs mt * wn = 4.
@@ -268,6 +272,11 @@ void gemm_bf16_rows_p(const __nv_bfloat16* x, int M, int K, const uint16_t* W0, 
 // act_quant(y) into q/qs. N and group_rows multiples of 128.
 void gemm_woa_p(const __nv_bfloat16* x, int M, const uint8_t* W, const uint8_t* S, int N, int K, int group_rows,
                 __nv_bfloat16* y, uint8_t* q, uint8_t* qs, cudaStream_t st);
+
+// wide64: gemv_fp8w_f32's matrix (FP8 L1 tiles, [N/32][K/32] scales, widened to bf16) as a GEMM, fp32 out, for
+// up to 128 rows in one read of W (DSpark's FP8 head in the one-pass drafter). N a multiple of 64.
+void gemm_fp8w_f32_p(const __nv_bfloat16* x, int M, const uint8_t* W, const uint8_t* S, int N, int K, float* y,
+                     cudaStream_t st);
 
 // Routed experts (E <= 1024 stacked as in MoeWeights) plus the shared expert for a chunk of M rows,
 // with the same result as moe(): picks bucketed by expert, grouped GEMMs per 64-row tile, each

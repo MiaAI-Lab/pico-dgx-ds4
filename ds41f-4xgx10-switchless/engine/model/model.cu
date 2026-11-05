@@ -984,6 +984,12 @@ void Model::Impl::forward_rows(int R, int ctx, uint32_t flags, Sink* sink, int p
     dump(sink, -1, "final_pre_norm", pos0, R, yraw, kDim * 2);
     dump(sink, -1, "final_hidden", pos0, R, hfin, kDim * 2);
   }
+  // wide64: DSGB10_HEADG (default on; 0: off) runs a wide step's head in one read of the weights (the coded-head
+  // GEMM, dsk::gemv_bf16_norm_rows: the same bits as the 16-row groups below)
+  static const bool headg = !getenv("DSGB10_HEADG") || atoi(getenv("DSGB10_HEADG")) != 0;
+  if (R > kDecodeRows && headg) {
+    dsk::gemv_bf16_norm_rows(yraw, norm_w, kNormEps, R, head, head_coded, kVocabPart, kDim, logits, chead, st);
+  } else
   for (int r0 = 0; r0 < R; r0 += kDecodeRows) {  // wide64: the head GEMVs in groups of kDecodeRows rows
     const int m = std::min(kDecodeRows, R - r0);
     const bf16* hin = yraw + (size_t)r0 * kDim;

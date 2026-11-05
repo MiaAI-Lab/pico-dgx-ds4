@@ -31,6 +31,10 @@ inline constexpr int kMaxHidden = 64;  // rows of a main_hidden buffer, at most:
 // takes at most kBatchEnts entries, kDraft rows each, within the kernels' 16 rows (dsk::kMaxRows,
 // attn::kMaxDecodeRows); kMaxEnts entries keep an anchor and results (the runner's ops::kMaxSess).
 inline constexpr int kBatchEnts = 3, kBatchRows = kDraft * kBatchEnts, kMaxEnts = 16;
+// wide64 (one-pass drafter): a pass of more than kBatchEnts entries (up to kWideEnts, kWideRows rows) runs its dense
+// projections as prefill GEMMs and its MoE as moe_prefill, the weights read once for every entry (~1 ulp from the
+// 15-row kernels: the drafts may differ, never the verified tokens). kCandStride: a pass's candidates per draft step.
+inline constexpr int kWideEnts = 16, kWideRows = kDraft * kWideEnts, kCandStride = kWideEnts;
 inline constexpr int kRanks = 4;
 inline constexpr int kDim = 5120, kHc = 4, kQLora = 1280;
 inline constexpr int kVocab = 129280, kVocabRank = kVocab / kRanks, kMarkov = 256;
@@ -229,7 +233,7 @@ class Draft {
   // rows: enable_batch() once, before any capture; draft() and accept() keep theirs.
   struct BatchPass {
     const int* ent;    // device [n]: the entries, in row order
-    int n;             // entries in the pass, 1..kBatchEnts
+    int n;             // entries in the pass, 1..kWideEnts (more than kBatchEnts: the wide pass)
     const int* tok;    // device: entry k's token at tok[k * tok_stride]
     int tok_stride;    // in ints
     const int* slot;   // device [kDraft * n]: each row's session slot
@@ -270,6 +274,8 @@ class Draft {
            const uint16_t* norm, cudaStream_t s);
   // mix() over a batch pass's rows, in the batch buffers (hc_project's rows per CTA group and hc_mix's CTA per
   // row keep every row's arithmetic its own)
+  void draft_batch_wide(const BatchPass& p, cudaStream_t s);        // wide64: more than kBatchEnts entries
+  void draft_batch_head(const BatchPass& p, int R, cudaStream_t s);  // a pass's head, Markov chains, confidence
   void bmix(const uint16_t* x, int rows, const float* fn, const float* fn_all, const float* scale, const float* base,
             const uint16_t* norm, cudaStream_t s);
   attn::Window win(int b, const int* slot) const;  // the current slot's, or through a step's table

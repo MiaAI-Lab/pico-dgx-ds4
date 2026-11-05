@@ -35,6 +35,15 @@ int spec_wide_rows() {
   return w;
 }
 int spec_row_cap() { return spec_wide_rows() ? spec_wide_rows() : kDecodeRows; }
+// wide64: DSGB10_DRAFT1=T (> dspark::kBatchEnts): batch steps of T or more entries draft them in one pass
+int draft1_min() {
+  static const int t = [] {
+    const char* e = getenv("DSGB10_DRAFT1");
+    const int v = e ? atoi(e) : 0;
+    return v > dspark::kBatchEnts ? std::min(v, (int)dspark::kWideEnts) : 0;
+  }();
+  return t;
+}
 
 namespace {
 
@@ -430,7 +439,7 @@ class RingComm final : public dspark::Comm {
   explicit RingComm(const comm::DevChannel& ch) : ch_(ch) {
     send_ = dalloc<uint32_t>(kBlock / 4);
     recv_ = dalloc<uint32_t>(kRanks * kBlock / 4);
-    f32_ = dalloc<float>((size_t)dspark::kBatchRows * dspark::kDim);  // a batch pass's rows at most
+    f32_ = dalloc<float>((size_t)dspark::kWideRows * dspark::kDim);  // a batch pass's rows at most (wide64: 80)
   }
   ~RingComm() override {
     cudaFree(send_);
@@ -459,7 +468,7 @@ class RingComm final : public dspark::Comm {
     k_gather_unpack<<<std::min(64, 4 * blocks), 256, 0, s>>>(a, recv_);
   }
   void all_reduce(const void* src, bool f32, uint16_t* dst, size_t n, cudaStream_t s) override {
-    if (n > (size_t)dspark::kBatchRows * dspark::kDim) die("spec: all_reduce of %zu", n);
+    if (n > (size_t)dspark::kWideRows * dspark::kDim) die("spec: all_reduce of %zu", n);
     if (!f32) {
       comm::allreduce_bf16(ch_, static_cast<const bf16*>(src), reinterpret_cast<bf16*>(dst), n, s);
     } else {
@@ -480,7 +489,7 @@ class RingComm final : public dspark::Comm {
   }
 
  private:
-  static constexpr uint32_t kBlock = 32768;
+  static constexpr uint32_t kBlock = 131072;  // wide64: the one-pass drafter's 80 rows of wq_a + wkv (72 KB)
   comm::DevChannel ch_;
   uint32_t *send_, *recv_;
   float* f32_;
@@ -914,10 +923,12 @@ cudaGraphExec_t Model::Impl::spec_batch_graph(int ctx) {
     for (int S = 1; S <= sp.bents; ++S) {
       cudaGraph_t body = pp.conditional.phGraph_out[S - 1];
       CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, body, nullptr, nullptr, 0, mode));
-      for (int c0 = 0; c0 < S; c0 += dspark::kBatchEnts) {
+      // wide64: DSGB10_DRAFT1=T: T or more entries draft in one pass (Draft::draft_batch_wide), not passes of 3
+      const int per = draft1_min() > 0 && S >= draft1_min() ? S : dspark::kBatchEnts;
+      for (int c0 = 0; c0 < S; c0 += per) {
         dspark::Draft::BatchPass bp{};
         bp.ent = sp.bent + c0;
-        bp.n = std::min(dspark::kBatchEnts, S - c0);
+        bp.n = std::min(per, S - c0);
         bp.tok = &sp.ss[0].bonus;
         bp.tok_stride = (int)(sizeof(ops::SpecState) / sizeof(int32_t));
         bp.slot = sp.pstab + (size_t)c0 * ops::kDrafts;
