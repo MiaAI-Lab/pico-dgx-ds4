@@ -50,6 +50,8 @@ struct Params {
   // moe_up's task queue in the workspace: [0] tasks claimed past the first wave, [1] CTAs done; both
   // zero between launches (the last CTA out resets them). Null: CTA b takes tasks b, b + grid, ...
   int* ctr;
+  // night T3 (EXPERIMENT): batch-aware re-routing (common.cuh router_row_oea) for calls of at least oea_min rows
+  int oea_k0 = 0, oea_kp = 0, oea_min = 1 << 30;
 };
 
 // The sorted union of the experts picked by M <= RB rows, with each row's routing weight.
@@ -63,6 +65,7 @@ struct Union {
   int pre[kMaskWords];
   int sel_id[RB * kTopK];  // moe_routed: the rows' picks
   float sel_w[RB * kTopK];
+  uint32_t cmask[kMaskWords];  // night T3: the batch's core experts (every row's top oea_k0)
 };
 
 // All threads of the CTA (>= 64, >= RB * kTopK). Reads idx/wts (or the logits) through L2: they come
@@ -72,11 +75,24 @@ __device__ void build_union(Union<RB>& U, const Params& a, int M) {
   const int tid = threadIdx.x, ne = M * kTopK;
   if (tid < kMaskWords) U.mask[tid] = 0;
   if (tid < RB * kTopK) U.rows[tid] = 0;
-  if (a.logits)
+  const bool oea = a.logits && a.oea_k0 > 0 && M >= a.oea_min;  // uniform over the CTA
+  if (oea) {
+    if (tid < kMaskWords) U.cmask[tid] = 0;
+    __syncthreads();
     for (int r = tid >> 5; r < M; r += blockDim.x >> 5) {
       int id;
       float w;
       router_row(a.logits + (size_t)r * a.E, a.bias, a.E, a.route_scale, id, w);
+      if ((tid & 31) < a.oea_k0) atomicOr(&U.cmask[id >> 5], 1u << (id & 31));
+    }
+    __syncthreads();
+  }
+  if (a.logits)
+    for (int r = tid >> 5; r < M; r += blockDim.x >> 5) {
+      int id;
+      float w;
+      if (oea) router_row_oea(a.logits + (size_t)r * a.E, a.bias, a.E, a.route_scale, U.cmask, a.oea_k0, a.oea_kp, id, w);
+      else router_row(a.logits + (size_t)r * a.E, a.bias, a.E, a.route_scale, id, w);
       if ((tid & 31) < kTopK) U.sel_id[r * kTopK + (tid & 31)] = id, U.sel_w[r * kTopK + (tid & 31)] = w;
     }
   __syncthreads();
@@ -1433,6 +1449,21 @@ void moe_routed(const uint8_t* xq, const uint8_t* xs, int M, const float* logits
   Params p{xq, xs, nullptr, nullptr, M, w, hq, hq + moe_hs_offset(M), y,
            logits, bias, E, route_scale, idx_out, wts_out};
   p.ctr = cfg.dyn ? reinterpret_cast<int*>(hq + kCtrOff) : nullptr;
+  // night T3: DSGB10_OEA=K0,KP,MINROWS (e.g. 4,12,9) turns batch-aware re-routing on (lossy; off by default)
+  static const int* oea = [] {
+    static int v[3] = {0, 0, 1 << 30};
+    if (const char* e = getenv("DSGB10_OEA")) {
+      int k0 = 0, kp = 0, mr = 0;
+      if (sscanf(e, "%d,%d,%d", &k0, &kp, &mr) == 3 && k0 >= 1 && k0 < kTopK && kp >= kTopK && kp <= 16 && mr >= 2) {
+        v[0] = k0, v[1] = kp, v[2] = mr;
+        fprintf(stderr, "moe: DSGB10_OEA re-routing on: keep top %d, prefer the batch's core among top %d, from %d rows\n", k0, kp, mr);
+      } else {
+        die("DSGB10_OEA=%s: K0,KP,MINROWS with 1 <= K0 < 6, 6 <= KP <= 16, MINROWS >= 2", e);
+      }
+    }
+    return v;
+  }();
+  p.oea_k0 = oea[0], p.oea_kp = oea[1], p.oea_min = oea[2];
   run_moe(p, cfg, st);
 }
 

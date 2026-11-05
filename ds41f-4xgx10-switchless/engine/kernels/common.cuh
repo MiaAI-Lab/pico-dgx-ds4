@@ -314,4 +314,67 @@ __device__ __forceinline__ void router_row(const float* logits, const float* bia
     if (lane == k) id_out = ids[k], w_out = picked[k] / sum * route_scale;
 }
 
+// night T3 (EXPERIMENT, lossy, off unless DSGB10_OEA is set): batch-aware expert re-routing (OEA-style). The row's
+// top-k0 picks stay; each of its other 6 - k0 picks prefers an expert the batch's core already loads (cmask: every
+// row's top-k0), taken in the row's own rank order among its top-kp by the biased key; slots not filled that way
+// keep the row's natural picks in rank order. The weights: router_row's formula over the chosen scores. One warp.
+__device__ __forceinline__ void router_row_oea(const float* logits, const float* bias, int E, float route_scale,
+                                               const uint32_t* cmask, int k0, int kp, int& id_out, float& w_out) {
+  constexpr int kPer = 16, kMaxP = 16;
+  const int lane = threadIdx.x & 31;
+  float sc[kPer], key[kPer];
+#pragma unroll
+  for (int j = 0; j < kPer; ++j) {
+    const int e = lane + 32 * j;
+    sc[j] = e < E ? __ldcg(logits + e) : 0.f;
+    key[j] = e < E ? __ldg(bias + e) : -INFINITY;
+  }
+#pragma unroll
+  for (int j = 0; j < kPer; ++j)
+    if (lane + 32 * j < E) {
+      const float l = sc[j];
+      sc[j] = sqrtf(l > 20.f ? l : log1pf(expf(l)));
+      key[j] = sc[j] + key[j];
+    }
+  int ids[kMaxP];
+  float scs[kMaxP];
+  for (int k = 0; k < kMaxP; ++k) {
+    if (k >= kp) break;
+    float bv = -INFINITY;
+    int bj = 0;
+#pragma unroll
+    for (int j = 0; j < kPer; ++j)
+      if (key[j] > bv) bv = key[j], bj = j;
+    int be = bv == -INFINITY ? 1 << 30 : lane + 32 * bj;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+      const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+      const int oe = __shfl_xor_sync(0xffffffffu, be, o);
+      if (ov > bv || (ov == bv && oe < be)) bv = ov, be = oe;
+    }
+    ids[k] = be;
+    float s = 0.f;
+#pragma unroll
+    for (int j = 0; j < kPer; ++j)
+      if (lane + 32 * j == be) s = sc[j], key[j] = -INFINITY;
+    scs[k] = __shfl_sync(0xffffffffu, s, be & 31);
+  }
+  int cid[kTopK];
+  float cs[kTopK];
+  int n = 0;
+  uint32_t used = 0;
+  for (int k = 0; k < k0; ++k) cid[n] = ids[k], cs[n] = scs[k], ++n, used |= 1u << k;
+  for (int k = k0; k < kp && n < kTopK; ++k) {
+    const int e = ids[k];
+    if (e < E && (cmask[e >> 5] >> (e & 31) & 1u)) cid[n] = e, cs[n] = scs[k], ++n, used |= 1u << k;
+  }
+  for (int k = k0; k < kp && n < kTopK; ++k)
+    if (!(used >> k & 1u)) cid[n] = ids[k], cs[n] = scs[k], ++n;
+  const float sum = (((cs[0] + cs[4]) + cs[2]) + ((cs[1] + cs[5]) + cs[3])) + 1e-20f;
+  id_out = 0, w_out = 0.f;
+#pragma unroll
+  for (int k = 0; k < kTopK; ++k)
+    if (lane == k) id_out = cid[k], w_out = cs[k] / sum * route_scale;
+}
+
 }  // namespace dsk
