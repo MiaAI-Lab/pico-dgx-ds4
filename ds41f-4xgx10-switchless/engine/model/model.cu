@@ -321,6 +321,9 @@ void Model::Impl::bind(dsw::WeightFile& wf, comm::Ring& ring) {
       w.gate = dalloc<uint8_t>((size_t)kExperts * kDim * 2);
       comm::allgather(ch, g, w.gate, (size_t)kGatePart * kDim * 2, st);
       w.gate_bias = reinterpret_cast<const float*>(need(p + "ffn.gate.bias", DType::F32, {kExperts}));
+      if (const dsw::DeviceTensor* vl = wf.find(p + "ffn.gate.bias_vl"))  // vision (prefill of image spans only)
+        if (vl->dtype == DType::F32 && vl->ndim == 1 && vl->shape[0] == kExperts)
+          w.gate_bias_vl = reinterpret_cast<const float*>(vl->data);
     }
     {
       dsk::MoeWeights& m = w.moe;
@@ -1046,6 +1049,24 @@ void Model::step(const Ctl& c, int32_t* sampled, Sink* sink) {
   for (int r = 0; r < c.rows; ++r) sampled[r] = o.row[r].token;
 }
 void Model::reset() { d_->hist.clear(); }
+void Model::set_images(int n, const int32_t* lo, const int32_t* hi, const uint16_t* rows) {
+  Impl& I = *d_;
+  I.img_span.clear(), I.img_row0.clear();
+  size_t total = 0;
+  for (int i = 0; i < n; ++i) {
+    if (hi[i] <= lo[i] || lo[i] < 0 || (i && lo[i] < hi[i - 1])) die("model: image span %d [%d, %d)", i, lo[i], hi[i]);
+    I.img_span.emplace_back(lo[i], hi[i]), I.img_row0.push_back(total), total += hi[i] - lo[i];
+  }
+  if (!n) return;
+  if (total > I.img_cap) {
+    I.drain();  // a chunk in flight may still read the old buffer
+    if (I.img_rows) CUDA_CHECK(cudaFreeHost(I.img_rows));
+    I.img_cap = std::max(total, (size_t)2048);
+    I.img_rows = detail::halloc<uint16_t>(I.img_cap * kDim);
+  }
+  I.drain();
+  std::memcpy(I.img_rows, rows, total * kDim * 2);
+}
 void Model::set_pos_stride(int stride, int group) {
   d_->pos_stride = std::max(1, stride);
   d_->pos_group = std::max(1, group);

@@ -157,6 +157,8 @@ void sample(const comm::DevChannel& ch, const float* logits, int vocab0, const S
 
 // x [R][4][5120] = embed[tokens[r]] in every copy; pre_mix [R][4] = (1, 0, 0, 0).
 void embed(const bf16* table, const int* tokens, int R, bf16* x, float* pre_mix, cudaStream_t s);
+// vision: rows [R][kDim] (bf16, may be pinned host memory) into the 4 hc copies of x's first R rows
+void inject_rows(const bf16* rows, int R, bf16* x, cudaStream_t s);
 
 // The attention input projections' all-gather. Each rank's block (bytes_per_rank) is
 // [qa R x 320 bf16 | kv R x 128 bf16 | ckv R x 128 f32 | csc R x 128 f32]; ncomp = 0 (no compressor),

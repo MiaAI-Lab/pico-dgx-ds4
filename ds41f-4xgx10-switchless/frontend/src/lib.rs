@@ -10,3 +10,4 @@ pub mod pyjson;
 pub mod server;
 pub mod session;
 pub mod tokenizer;
+pub mod vision;

@@ -80,7 +80,7 @@ void hash_positions(const HashMap& m, const int32_t* tokens, const uint8_t* live
     bool blocked = false;
     for (int s = 0; s < kMaxNgram; s++) {
       const int64_t src = pos - s < 0 ? 0 : pos - s;
-      blocked = blocked || pos < s || (live && !live[src]);
+      blocked = blocked || pos < s || (live && !live[src]) || tokens[src] < 0;  // < 0: an image span (vision)
       t[s] = blocked ? m.pad : m.token_map[tokens[src]];
     }
     for (int l = 0; l < kLayers; l++) {

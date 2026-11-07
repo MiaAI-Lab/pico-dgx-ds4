@@ -37,7 +37,21 @@ enum SubmitFlags : uint32_t {
   kFlagSeed = 1,      // use SubmitHeader::seed
   kFlagKeep = 2,      // keep the session's state after DONE
   kFlagLogprobs = 4,  // send logprobs in TOKENS
+  // vision (docs/vision.md): after prompt[], uint32 n_images, ImageSpan spans[n_images], then the spans' rows,
+  // bf16 [sum rows][5120] in span order. Only image requests set it; a text SUBMIT is unchanged.
+  kFlagImages = 8,
 };
+
+// An image's span of the prompt: positions [start, start + rows), every id 129264 (<｜deepseek_image｜>);
+// its rows (the encoder's: IMAGE_START, the aligner rows with IMAGE_NEW_LINE after each grid row,
+// IMAGE_END) replace the token embeddings there, the span routes with ffn.gate.bias_vl and is dead to Engram.
+struct ImageSpan {
+  uint32_t start;
+  uint32_t rows;
+  uint64_t hash;  // of the image's bytes (logs)
+};
+constexpr int kImageDim = 5120;
+constexpr uint32_t kImageTokenId = 129264;
 
 struct SubmitHeader {
   uint64_t req_id;           // unique per connection
@@ -118,6 +132,7 @@ static_assert(offsetof(SubmitHeader, n_prompt) == 64);
 static_assert(sizeof(HelloEngine) == 24);
 static_assert(sizeof(TokensHeader) == 16);
 static_assert(sizeof(TopLogprob) == 8);
+static_assert(sizeof(ImageSpan) == 16);
 static_assert(sizeof(DoneHeader) == 56);
 static_assert(offsetof(DoneHeader, queue_us) == 24);
 

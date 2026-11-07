@@ -80,7 +80,7 @@
 namespace srv {
 namespace {
 
-constexpr uint32_t kMaxFrame = 64u << 20;
+constexpr uint32_t kMaxFrame = 192u << 20;  // a SUBMIT with images carries ~10.5 MB per 1024-token image
 constexpr int kIoCpu = 12;
 
 std::atomic<bool> g_stop{false};
@@ -135,6 +135,9 @@ struct Request {
   fe::SubmitHeader h{};
   std::vector<int32_t> stop, prompt;
   double t_recv = 0;
+  // vision (fe::kFlagImages): the image spans and their rows, bf16 [sum rows][kImageDim]; empty for text
+  std::vector<fe::ImageSpan> spans;
+  std::vector<uint16_t> img;
 };
 
 struct Event {
@@ -260,12 +263,26 @@ class Io {
       Request& r = e.rq;
       if (p.size() < sizeof r.h) return false;
       std::memcpy(&r.h, p.data(), sizeof r.h);
-      if (p.size() != sizeof r.h + 4 * (size_t(r.h.n_stop_ids) + r.h.n_prompt)) return false;
+      const size_t base = sizeof r.h + 4 * (size_t(r.h.n_stop_ids) + r.h.n_prompt);
+      if (!(r.h.flags & fe::kFlagImages) ? p.size() != base : p.size() < base + 4) return false;
       r.stop.resize(r.h.n_stop_ids);
       r.prompt.resize(r.h.n_prompt);
       const char* a = p.data() + sizeof r.h;
       if (!r.stop.empty()) std::memcpy(r.stop.data(), a, r.stop.size() * 4);
       if (!r.prompt.empty()) std::memcpy(r.prompt.data(), a + r.stop.size() * 4, r.prompt.size() * 4);
+      if (r.h.flags & fe::kFlagImages) {  // vision: n, the spans, their rows
+        uint32_t ni = 0;
+        std::memcpy(&ni, p.data() + base, 4);
+        if (ni < 1 || ni > 64 || p.size() < base + 4 + ni * sizeof(fe::ImageSpan)) return false;
+        r.spans.resize(ni);
+        std::memcpy(r.spans.data(), p.data() + base + 4, ni * sizeof(fe::ImageSpan));
+        size_t rows = 0;
+        for (const auto& s : r.spans) rows += s.rows;
+        const size_t off = base + 4 + ni * sizeof(fe::ImageSpan);
+        if (p.size() != off + rows * fe::kImageDim * 2) return false;
+        r.img.resize(rows * fe::kImageDim);
+        std::memcpy(r.img.data(), p.data() + off, r.img.size() * 2);
+      }
       r.conn = c;
       r.t_recv = now_s();
       push(std::move(e));
@@ -872,6 +889,13 @@ class Server {
     else if (!(h.temperature >= 0.f) || !(h.top_p > 0.f && h.top_p <= 1.f)) err = "bad sampling parameters";
     for (const int32_t t : f.rq.prompt)
       if (err.empty() && (t < 0 || t >= model::kVocab)) err = "token id out of range";
+    for (size_t i = 0, end = 0; err.empty() && i < f.rq.spans.size(); ++i) {  // vision: spans in order, all image ids
+      const fe::ImageSpan& s = f.rq.spans[i];
+      if (s.rows < 3 || s.start < end || (size_t)s.start + s.rows >= (size_t)n) err = "bad image span";
+      for (uint32_t k = 0; err.empty() && k < s.rows; ++k)
+        if ((uint32_t)f.rq.prompt[s.start + k] != fe::kImageTokenId) err = "image span over a text token";
+      end = (size_t)s.start + s.rows;
+    }
     if (!err.empty() || Io::cancelled(f.rq)) {
       done(f.rq, err.empty() ? fe::kCancelled : fe::kError, 0, 0, f.t_start, 0, err);
       return Io::forget(f.rq);
@@ -1022,8 +1046,11 @@ class Server {
       issue(c);
       m_.mark(1);
       std::vector<int32_t> t(prompt.begin() + c.pos0, prompt.end());
+      for (const fe::ImageSpan& sp : f.rq.spans)  // vision: image positions are dead to Engram (-1)
+        for (int k = std::max<int>(sp.start, c.pos0); k < (int)(sp.start + sp.rows); ++k) t[k - c.pos0] = -1;
       bcast_payload(ring_, t.data(), t.size() * 4, 0);
       m_.set_tokens(c.pos0, c.n, t.data());
+      if (!f.rq.spans.empty()) images(f.rq);
       tu.ops_ms = 1e3 * (now_s() - (resume ? t0 : f.t_start));
     }
     // ---- prefill [q, n): chunks of prefill_rows; a short remainder as one step
@@ -1048,7 +1075,9 @@ class Server {
         if (sn >= 128 && c.n_snaps < kMaxSnaps && (!o_.snap_thin || keep_snap(sn, n, o_.snap_every)))
           c.snaps[c.n_snaps++] = sn;  // none that the prompt's end would thin at once
       wd_.started = now_s();
-      if (R <= o_.small_rows && !ced) {
+      bool img = false;  // vision: rows of an image span take the chunk path (the step path has no injection)
+      for (const fe::ImageSpan& sp : f.rq.spans) img = img || (int)(sp.start + sp.rows) > pos;
+      if (R <= o_.small_rows && !ced && !img) {
         c.op = kCmdRows;
         std::copy(prompt.begin() + pos, prompt.begin() + pos + R, c.tokens);
         issue(c);
@@ -1076,6 +1105,13 @@ class Server {
       wd_.started = 0;
       S->hist.insert(S->hist.end(), prompt.begin() + pos, prompt.begin() + pos + R);
       pos += R;
+    }
+    if (!f.rq.spans.empty()) {  // vision: the spans are for this prompt's chunks only
+      Cmd c{};
+      c.op = kCmdImages;
+      c.n = 0;
+      issue(c);
+      m_.set_images(0, nullptr, nullptr, nullptr);
     }
     const double t_first = now_s();
     if (resume) f.resume_s += t_first - t0;
@@ -1113,6 +1149,24 @@ class Server {
     if (stop_id(f, tok0)) return ended(f, fe::kStop);
     if ((int)f.out.size() >= (int)h.max_new_tokens) return ended(f, fe::kLength);
     return true;
+  }
+
+  // Vision: rq's spans and rows to every rank (kCmdImages), for the prefill chunks that follow.
+  void images(const Request& rq) {
+    const double t0 = now_s();
+    Cmd c{};
+    c.op = kCmdImages;
+    c.n = (int)rq.spans.size();
+    issue(c);
+    std::vector<int32_t> lh(2 * rq.spans.size());
+    for (size_t i = 0; i < rq.spans.size(); ++i)
+      lh[i] = (int32_t)rq.spans[i].start, lh[rq.spans.size() + i] = (int32_t)(rq.spans[i].start + rq.spans[i].rows);
+    bcast_payload(ring_, lh.data(), lh.size() * 4, 0);
+    std::vector<uint16_t> rows(rq.img);
+    bcast_payload(ring_, rows.data(), rows.size() * 2, 0);
+    m_.set_images(c.n, lh.data(), lh.data() + c.n, rows.data());
+    std::printf("serve: req %llu images: %d spans, %zu rows, sent to every rank in %.1f ms\n",
+                (unsigned long long)rq.h.req_id, c.n, rows.size() / fe::kImageDim, 1e3 * (now_s() - t0));
   }
 
   bool ended(Flight& f, uint32_t why) {

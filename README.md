@@ -52,10 +52,33 @@
   wide step .......... DSGB10_WIDE=64, steps of 17-64 rows via prefill GEMMs + moe_prefill
   1-pass drafter ..... DSGB10_DRAFT1=6, every session drafts in one pass
   cost gate .......... DSGB10_WIDE_COST, wide only when the drafts pay for it
+  vision ............. image_url / base64 images via the checkpoint's own ViT (side encoder)
 ```
 
 Per-commit details and measured before/after numbers are in [CHANGES.md](CHANGES.md); the design is in
 [docs/wide64.md](ds41f-4xgx10-switchless/docs/wide64.md).
+
+## ✧ vision
+
+Images work through the normal OpenAI API (`image_url` with a `data:` URL or an http(s) URL, several per
+request). The checkpoint's own ViT + aligner runs as a small side encoder (~1 GB of GPU memory on rank 0), and the
+engine puts its rows in place of the image tokens during prefill only. Text requests take exactly the old path.
+
+```
+┌──────────────────────────────────┬────────────────────────────┐
+│ image checks (temp 0)            │ 15/15 (10 known answers,   │
+│                                  │ 2-image, image + 28K text, │
+│                                  │ http URL, bad image = 400) │
+│ TTFT added per image             │ ~0.17-0.47 s (median ~0.26)│
+│ encoder, warm                    │ 100-160 ms / image         │
+│ text after: chat / code c1       │ 81.9 / 144.4 (was 79.7/138)│
+│ text after: 16 distinct users    │ 380 (was 367)              │
+│ text after: agents, qeval        │ 266 (260), 71/72 (71/71)   │
+└──────────────────────────────────┴────────────────────────────┘
+  differences in text numbers are run-to-run noise; images 214-460 tokens each
+```
+
+Design, protocol and the full numbers: [docs/vision.md](ds41f-4xgx10-switchless/docs/vision.md).
 
 ## ✧ run it
 
@@ -67,7 +90,9 @@ DSGB10_ENGINE_ARGS="--max-ctx 1048576 --slots 16 --big-slots 4 \
 ```
 
 The full 4-Spark setup (switch, kernel, weights, serve, benchmarks) is in its companion repo,
-**spark-deepseek-setup**. Drop `DSGB10_OEA` for a strictly lossless build.
+**spark-deepseek-setup**. Drop `DSGB10_OEA` for a strictly lossless build. For images, start the encoder
+(`tools/vision/vision_encoder.py`, see [docs/vision.md](ds41f-4xgx10-switchless/docs/vision.md#running-it)) and add
+`--vision-addr 127.0.0.1:18950` to the front-end's arguments.
 
 ## ✧ credits
 

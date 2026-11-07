@@ -759,6 +759,18 @@ void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
       std::vector<int32_t> t(c.n);
       bcast_payload(ring, t.data(), t.size() * 4, rank);
       m.set_tokens(c.pos0, c.n, t.data());
+    } else if (c.op == kCmdImages) {
+      if (c.n <= 0) {
+        m.set_images(0, nullptr, nullptr, nullptr);
+      } else {
+        std::vector<int32_t> lh(2 * c.n);
+        bcast_payload(ring, lh.data(), lh.size() * 4, rank);
+        size_t rows = 0;
+        for (int i = 0; i < c.n; ++i) rows += lh[c.n + i] - lh[i];
+        std::vector<uint16_t> img(rows * 5120);
+        bcast_payload(ring, img.data(), img.size() * 2, rank);
+        m.set_images(c.n, lh.data(), lh.data() + c.n, img.data());
+      }
     } else if (c.op == kCmdPrefill) {
       wd.started = now_s();
       const uint64_t n = run_prefill(m, c);

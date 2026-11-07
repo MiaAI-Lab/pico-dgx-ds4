@@ -48,6 +48,8 @@ pub struct ServerConfig {
     /// How long a request waits while the engine is down (the ring lent, or a restart) before it is
     /// answered 503 with Retry-After.
     pub hold: Duration,
+    /// vision: the image encoder's address (host:port); None: image input is refused as before
+    pub vision_addr: Option<String>,
 }
 
 pub struct App {
@@ -207,6 +209,8 @@ pub struct Prepared {
     /// besides EOS, unless ignore_eos
     pub stop_ids: Vec<u32>,
     pub ignore_eos: bool,
+    /// vision: the image records in prompt order (encoding.py's), one per placeholder; empty for text
+    pub images: Vec<Value>,
 }
 
 fn num_f64(v: &Value) -> Option<f64> {
@@ -291,7 +295,7 @@ fn tool_call_json(enc: Encoding, index: Option<usize>, id_hex: String, name: &st
 }
 
 /// Messages for the encoder: OpenAI fields only, developer → system, null content → "".
-fn convert_messages(msgs: &[Value]) -> Result<Vec<Value>, String> {
+fn convert_messages(msgs: &[Value], vision: bool) -> Result<Vec<Value>, String> {
     let mut out = Vec::with_capacity(msgs.len());
     for (i, m) in msgs.iter().enumerate() {
         let o = m.as_object().ok_or(format!("messages[{i}] is not an object"))?;
@@ -308,6 +312,10 @@ fn convert_messages(msgs: &[Value]) -> Result<Vec<Value>, String> {
             Some(Value::Array(parts)) => {
                 for p in parts {
                     match p.get("type").and_then(Value::as_str) {
+                        Some("image_url" | "image") if vision => {}
+                        Some("input_image" | "video_url" | "input_audio" | "audio_url") if vision => {
+                            return Err("audio and video input are not supported; images go in image_url parts".into())
+                        }
                         Some("image_url" | "image" | "input_image" | "video_url" | "input_audio" | "audio_url") => {
                             return Err("image, audio and video input are not supported".into())
                         }
@@ -347,7 +355,7 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
             return Err("only n = 1 is supported".into());
         }
     }
-    let mut messages = convert_messages(msgs)?;
+    let mut messages = convert_messages(msgs, cfg.vision_addr.is_some())?;
 
     // tools, hosted on a leading system message
     let tool_choice_none = r.get("tool_choice").and_then(Value::as_str) == Some("none");
@@ -387,7 +395,10 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
     let mut o = EncodeOptions::new(mode);
     o.reasoning_effort = Some(&budget);
     o.encoding = cfg.encoding;
-    let (prompt, _) = encode_messages(&messages, &o).map_err(|e| format!("cannot encode messages: {e}"))?;
+    let (prompt, images) = encode_messages(&messages, &o).map_err(|e| format!("cannot encode messages: {e}"))?;
+    if images.len() > crate::vision::MAX_IMAGES {
+        return Err(format!("at most {} images per request", crate::vision::MAX_IMAGES));
+    }
 
     // sampling and limits
     let max_tokens = match r.get("max_completion_tokens").filter(|v| !v.is_null()).or(r.get("max_tokens").filter(|v| !v.is_null())) {
@@ -436,6 +447,7 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
         stops,
         stop_ids,
         ignore_eos,
+        images,
     })
 }
 
@@ -641,6 +653,9 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
     let Some(info) = app.engine.info() else {
         return Err(unavailable("engine not connected".into()));
     };
+    if !p.images.is_empty() {
+        return start_images(app, p, pass, info).await;
+    }
     let (plan, released) = {
         let app2 = app.clone();
         let text = p.prompt.clone();
@@ -682,6 +697,7 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         prefix_hint: plan.reused as u32,
         stop_ids: stop_ids.clone(),
         prompt: plan.ids.clone(),
+        images: None,
     };
     let (req_id, rx) = match app.engine.submit(submit) {
         Ok(x) => x,
@@ -699,6 +715,81 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         session_id: plan.session_id,
         prompt_text: p.prompt.clone(),
         prompt_ids: plan.ids,
+        rx,
+        stop_ids,
+        stopper: StopMatcher::new(p.stops.clone()),
+        parser: StreamParser::with_tools(p.mode, p.tools),
+        dec: StreamDecoder::default(),
+        ids: Vec::new(),
+        kept: 0,
+        gen_bytes: Vec::new(),
+        gen_ends: Vec::new(),
+        stopped: None,
+        done: false,
+        t0: Instant::now(),
+        first_token: None,
+    })
+}
+
+/// A request with images (docs/vision.md): its images through the encoder, the placeholders expanded into
+/// their spans, and a session of its own that the engine frees at the end (no KEEP) and the text table
+/// never sees, so text requests' prefix reuse is untouched.
+async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::protocol::HelloEngine) -> Result<Gen, ApiError> {
+    let bad = |msg: String| ApiError(StatusCode::BAD_REQUEST, "invalid_request_error".into(), msg);
+    let Some(addr) = app.cfg.vision_addr.clone() else {
+        return Err(bad("image, audio and video input are not supported".into()));
+    };
+    let enc = crate::vision::encode(&addr, &p.images, Duration::from_secs(90)).await.map_err(|e| {
+        if e.starts_with("cannot read") { bad(e) } else { ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e) }
+    })?;
+    let ids = {
+        let (app2, text) = (app.clone(), p.prompt.clone());
+        tokio::task::spawn_blocking(move || app2.tok.encode_parallel(&text, app2.cfg.tokenize_threads))
+            .await
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string()))?
+    };
+    let (ids, starts) = crate::vision::expand(&ids, &enc.rows).map_err(bad)?;
+    let ctx = info.max_context as usize;
+    if ids.len() >= ctx {
+        return Err(bad(format!("the prompt is {} tokens with its images; the context window is {ctx}", ids.len())));
+    }
+    let max_new = (p.max_tokens as usize).min(ctx - ids.len()) as u32;
+    let mut stop_ids = p.stop_ids.clone();
+    if !p.ignore_eos {
+        stop_ids.push(info.eos_id);
+    }
+    let session_id = (1u64 << 63) | u64::from_str_radix(&app.random_hex(15), 16).unwrap_or(1);
+    let submit = Submit {
+        req_id: 0,
+        session_id,
+        base_session_id: 0,
+        seed: p.seed.unwrap_or(0),
+        temperature: p.temperature,
+        top_p: p.top_p,
+        top_k: p.top_k,
+        max_new_tokens: max_new,
+        flags: crate::protocol::FLAG_IMAGES | if p.seed.is_some() { FLAG_SEED } else { 0 },
+        n_top_logprobs: 0,
+        prefix_hint: 0,
+        stop_ids: stop_ids.clone(),
+        prompt: ids.clone(),
+        images: Some(crate::vision::payload(&starts, &enc)),
+    };
+    let (req_id, rx) = app.engine.submit(submit).map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_error".into(), e))?;
+    eprintln!(
+        "req {req_id} images: {} ({} rows), encoder {:.0} ms; prompt {} ids; session {session_id} (not kept)",
+        enc.rows.len(),
+        enc.rows.iter().sum::<u32>(),
+        enc.ms,
+        ids.len()
+    );
+    Ok(Gen {
+        app: app.clone(),
+        _pass: pass,
+        req_id,
+        session_id,
+        prompt_text: p.prompt.clone(),
+        prompt_ids: ids,
         rx,
         stop_ids,
         stopper: StopMatcher::new(p.stops.clone()),
@@ -898,6 +989,7 @@ mod tests {
             tokenize_threads: 1,
             dump_dir: None,
             hold: Duration::from_secs(600),
+            vision_addr: None,
         }
     }
 

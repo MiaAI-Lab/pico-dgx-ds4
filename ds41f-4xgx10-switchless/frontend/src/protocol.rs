@@ -20,6 +20,8 @@ pub const T_DONE: u16 = 0x83;
 pub const FLAG_SEED: u32 = 1;
 pub const FLAG_KEEP: u32 = 2;
 pub const FLAG_LOGPROBS: u32 = 4;
+/// vision: the image part (vision::payload) follows prompt[]
+pub const FLAG_IMAGES: u32 = 8;
 
 pub const TOK_LOGPROBS: u32 = 1;
 pub const TOK_TOP: u32 = 2;
@@ -60,6 +62,8 @@ pub struct Submit {
     pub prefix_hint: u32,
     pub stop_ids: Vec<u32>,
     pub prompt: Vec<u32>,
+    /// vision: the image part after prompt[] (with FLAG_IMAGES); None for text
+    pub images: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -159,6 +163,9 @@ impl Frame {
                 w.u32(s.flags).u32(s.n_top_logprobs).u32(s.prefix_hint);
                 w.u32(s.stop_ids.len() as u32).u32(s.prompt.len() as u32).u32(0);
                 w.u32s(&s.stop_ids).u32s(&s.prompt);
+                if let Some(img) = &s.images {
+                    w.0.extend_from_slice(img);
+                }
                 w.finish()
             }
             Frame::Cancel { req_id } => {
@@ -245,6 +252,7 @@ impl Frame {
                     prefix_hint,
                     stop_ids,
                     prompt,
+                    images: None,
                 })
             }
             T_CANCEL => Frame::Cancel { req_id: r.u64()? },
@@ -363,6 +371,7 @@ mod tests {
             prefix_hint: 5,
             stop_ids: vec![1],
             prompt: vec![0, 10, 20],
+            images: None,
         };
         let b = Frame::Submit(s.clone()).encode();
         assert_eq!(b.len(), 8 + 72 + 4 + 12); // header, SubmitHeader, stop id, prompt

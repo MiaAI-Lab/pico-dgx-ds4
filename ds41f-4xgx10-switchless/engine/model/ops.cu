@@ -42,6 +42,17 @@ __global__ void k_embed(const bf16* table, const int* tokens, bf16* x, float* pr
   if (threadIdx.x < kHc) pre_mix[r * kHc + threadIdx.x] = threadIdx.x == 0 ? 1.f : 0.f;
 }
 
+__global__ void k_inject_rows(const bf16* rows, bf16* x) {
+  const int r = blockIdx.x;
+  const uint4* src = reinterpret_cast<const uint4*>(rows + (size_t)r * kDim);
+  uint4* dst = reinterpret_cast<uint4*>(x + (size_t)r * kHcDim);
+  for (int i = threadIdx.x; i < kDim / 8; i += blockDim.x) {
+    const uint4 v = src[i];
+#pragma unroll
+    for (int c = 0; c < kHc; ++c) dst[c * (kDim / 8) + i] = v;
+  }
+}
+
 __global__ void k_unpack_attn(const uint8_t* gath, int R, int ncomp, size_t per_rank, bf16* qa, bf16* kv, float* ckv,
                               float* csc) {
   const int p = blockIdx.x;
@@ -188,6 +199,12 @@ void step_in(const StepIn* ring, uint32_t* counter, const int32_t* fb, StepIn* d
 
 void embed(const bf16* table, const int* tokens, int R, bf16* x, float* pre_mix, cudaStream_t s) {
   k_embed<<<R, 256, 0, s>>>(table, tokens, x, pre_mix);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void inject_rows(const bf16* rows, int R, bf16* x, cudaStream_t s) {
+  if (R <= 0) return;
+  k_inject_rows<<<R, 256, 0, s>>>(rows, x);
   CUDA_CHECK(cudaGetLastError());
 }
 

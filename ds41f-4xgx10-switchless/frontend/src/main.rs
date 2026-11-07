@@ -30,6 +30,8 @@ fn usage() -> ! {
                                 start (mode 600, in a directory of mode 700; it holds the
                                 conversations' text), so that the engine's kept sessions are found again
       --table-days N            sessions unused for longer are not kept: 7
+      --vision-addr HOST:PORT   accept image_url / image parts: the image encoder (tools/vision) turns
+                                them into embedding rows (docs/vision.md); without it images are refused
   dsfront admin --socket PATH <command>               one command to a server's admin socket; prints
                                                       the answer (docs/engine.md, \"Launch and stop\")
   dsfront mock-engine [options]                       a rank-0 stand-in (docs/protocol.md)
@@ -117,6 +119,7 @@ fn serve(args: &[String]) {
         tokenize_threads: parse_opt(args, "--tokenize-threads", 8usize).max(1),
         dump_dir: opt(args, "--dump-dir").map(Into::into),
         hold: std::time::Duration::from_secs(parse_opt(args, "--hold-s", 600u64)),
+        vision_addr: opt(args, "--vision-addr"),
     };
     let admin = opt(args, "--admin-socket");
     let table = opt(args, "--table-file").map(std::path::PathBuf::from);

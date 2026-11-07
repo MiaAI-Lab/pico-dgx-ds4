@@ -1,0 +1,81 @@
+[
+ [
+  "01_ocr_sign.png",
+  "What gate number and what city are shown on this sign? Answer as 'gate, city'.",
+  [
+   "47B",
+   "Lisbon"
+  ]
+ ],
+ [
+  "02_ocr_receipt.png",
+  "What is the TOTAL on this receipt, and what is the name of the shop? Answer briefly.",
+  [
+   "10.50",
+   "CORNER CAFE"
+  ]
+ ],
+ [
+  "03_count_red.png",
+  "How many red circles are in this image? Answer with just the number.",
+  [
+   "7"
+  ]
+ ],
+ [
+  "04_count_shapes.png",
+  "How many blue squares and how many green triangles are there? Answer as 'squares: N, triangles: M'.",
+  [
+   "4",
+   "5"
+  ]
+ ],
+ [
+  "05_bar_chart.png",
+  "In this bar chart, which day has the most orders and roughly how many? Answer as 'day, number'.",
+  [
+   "Thu",
+   "45"
+  ]
+ ],
+ [
+  "06_table.png",
+  "According to this table, which city has the largest population? Answer with the city name.",
+  [
+   "Osaka"
+  ]
+ ],
+ [
+  "07_code.png",
+  "This is a screenshot of Python code. What does it print? Answer with just the number.",
+  [
+   "18"
+  ]
+ ],
+ [
+  "08_flag.png",
+  "Name the three colours of the vertical stripes from left to right.",
+  [
+   "green",
+   "white",
+   "red"
+  ]
+ ],
+ [
+  "09_math.png",
+  "Solve the arithmetic problem written in the image. Answer with just the number.",
+  [
+   "395"
+  ]
+ ],
+ [
+  "10_position.png",
+  "There is a yellow circle and a purple square. In which corner of the image is the yellow circle (top-left, top-right, bottom-left, bottom-right)?",
+  [
+   [
+    "top-right",
+    "top right"
+   ]
+  ]
+ ]
+]

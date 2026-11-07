@@ -61,6 +61,7 @@ struct LayerW {
   // FFN
   uint8_t* gate = nullptr;  // bf16 [384][5120], tile_fp8 layout: every rank's 96 rows, all-gathered at bind
   const float* gate_bias = nullptr;
+  const float* gate_bias_vl = nullptr;  // vision: image-span rows' selection bias (nullptr: the file lacks it)
   dsk::MoeWeights moe{};
   // mHC: the full projections [24][20480] (all-gathered at bind), base [24], scale [3]
   float* hc_fn[2] = {};
@@ -187,6 +188,20 @@ struct Model::Impl {
   std::vector<int32_t> hists[kMaxUnits];  // the other slots' by unit (use_slot swaps them in and out)
   std::vector<int32_t>& hist_of(int u) { return u == cur_unit ? hist : hists[u]; }
   std::vector<uint32_t> ids;  // [R][2][24]
+  // vision (docs/vision.md, set_images): the spans of the prefill in progress and their rows (pinned,
+  // mapped: the inject kernel reads them in place); empty for every text request
+  std::vector<std::pair<int, int>> img_span;
+  std::vector<size_t> img_row0;  // span i's first row in img_rows
+  uint16_t* img_rows = nullptr;
+  size_t img_cap = 0;  // rows img_rows holds
+  // this rank's rows [i0, i1) of the current chunk (absolute first position a) inside span k, clipped to [0, n)
+  template <class F>
+  void img_runs(int a, int n, F&& f) const {
+    for (size_t k = 0; k < img_span.size(); ++k) {
+      const int i0 = std::max(0, img_span[k].first - a), i1 = std::min(n, img_span[k].second - a);
+      if (i0 < i1) f(k, i0, i1);
+    }
+  }
   uint8_t* e_send[2];         // pinned: this rank's packed records per Engram layer
   uint32_t* e_off[2];         // pinned: [R][24] offsets into the gathered segments
   uint64_t* e_done;           // pinned: the store's completion flags [2]

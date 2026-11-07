@@ -65,6 +65,9 @@ enum : int32_t {
   // BatchEntry's and then their tokens follow as payloads. (20: clear of the batch commands added beside it.)
   kCmdBatchTf = 20,
   kCmdSpecBatch = 8,  // spec_batch_loop (B3): the same with drafts; the Cmd's spec_* fields as kCmdDecode's
+  // vision (docs/vision.md): n image spans for the prefill chunks that follow (Model::set_images; n = 0 clears
+  // them); their bounds (int32 lo[n], hi[n]) and rows (bf16 [rows][5120]) follow as payloads
+  kCmdImages = 21,
 };
 enum : uint32_t { kPfSample = 1, kPfCed = 2 };  // kPfCed: a CED chunk (Model::prefill's ced, docs/ced.md)
 struct Cmd {

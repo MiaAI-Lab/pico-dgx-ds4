@@ -256,6 +256,12 @@ void Model::Impl::engram_apply_p(int L, int M, int set) {
   for (int r = 0; r < kRanks; ++r)
     ops::engram_partial(p.x, p.e_kv + (size_t)r * p.Q * kEngramN, w.e_w, r, n, p.e_part + (size_t)r * n * kEngramPartBytes,
                         st);
+  if (!img_span.empty())  // vision: image rows pass through (gate * 0), as model.py's token_mask
+    img_runs(p.a_cur + p.r0, n, [&](size_t, int i0, int i1) {
+      for (int r = 0; r < kRanks; ++r)
+        CUDA_CHECK(cudaMemset2DAsync(p.e_part + ((size_t)r * n + i0) * kEngramPartBytes + 32, kEngramPartBytes, 0,
+                                     (size_t)kEngramSeg * 2, i1 - i0, st));
+    });
   ops::engram_combine(p.x, p.e_part, n, p.x, st);
   (void)M;
 }
@@ -447,6 +453,11 @@ void Model::Impl::ffn_p(int L, int M) {
     dsk::gemm_bf16_p(p.y, n, w.gate, kExperts, kDim, p.gl, st);
     dsk::router_topk(p.gl, w.gate_bias, n, kExperts, p.ridx + (size_t)r0 * kTopK, p.rwts + (size_t)r0 * kTopK,
                      kRouteScale, st);
+    if (!img_span.empty() && w.gate_bias_vl)  // vision: image-span rows route with the VL bias (model.py Gate)
+      img_runs(p.a_cur + r0, n, [&](size_t, int i0, int i1) {
+        dsk::router_topk(p.gl + (size_t)i0 * kExperts, w.gate_bias_vl, i1 - i0, kExperts,
+                         p.ridx + (size_t)(r0 + i0) * kTopK, p.rwts + (size_t)(r0 + i0) * kTopK, kRouteScale, st);
+      });
   }
   // every row's act_quant and routes for the MoE
   const comm::AgSeg ag[4] = {{p.yq + (size_t)r0 * kDim, p.yq, (size_t)Q * kDim},
@@ -552,6 +563,7 @@ void Model::Impl::ced_replay(int P, const std::vector<std::pair<int, uint8_t*>>&
   for (int q = s; q < P; ++q)
     if (p.ced_pos[q % kReplay] != q) die("model: CED replay of [%d, %d) without the encoder's position %d", s, P, q);
   p.rq = q_rows(M), p.r0 = rank * p.rq, p.n = std::max(0, std::min(p.rq, M - p.r0));
+  p.a_cur = s;
   comm::allgather(ch, p.ced_rows, p.ced_gath, (size_t)kReplay * kCedRow, st);
   for (int i = 0; i < p.n;) {  // runs of consecutive slots from one rank
     const int slot = (s + p.r0 + i) % kReplay, src = p.ced_src[slot];
@@ -602,9 +614,18 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
   CUDA_CHECK(cudaEventRecord(ev_beg[slot], st));
   CUDA_CHECK(cudaEventRecord(ev_pf[0], st));
   std::memcpy(p.tok_h, hist.data() + a, (size_t)M * 4);
+  p.a_cur = a;
+  if (!img_span.empty())  // vision: the spans' ids are -1 in the history (Engram); embed a real id, then the rows
+    for (int i = 0; i < M; ++i)
+      if (p.tok_h[i] < 0) p.tok_h[i] = 129264;
   CUDA_CHECK(cudaMemcpyAsync(p.tok, p.tok_h, (size_t)M * 4, cudaMemcpyHostToDevice, st));
   ops::iota(p.pos, a, M, st);
   if (p.n > 0) ops::embed(embed, p.tok + p.r0, p.n, p.x, p.pm, st);
+  if (!img_span.empty() && p.n > 0)
+    img_runs(a + p.r0, p.n, [&](size_t k, int i0, int i1) {
+      const size_t row = img_row0[k] + (size_t)(a + p.r0 + i0 - img_span[k].first);
+      ops::inject_rows(reinterpret_cast<const bf16*>(img_rows) + row * kDim, i1 - i0, p.x + (size_t)i0 * kHcDim, st);
+    });
   if (ced && a != p.ced_end) std::fill(p.ced_pos, p.ced_pos + kReplay, -1);  // a new run of positions
   p.ced_end = ced ? a + M : -1;
 #ifdef DSGB10_NVTX
@@ -646,7 +667,7 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
     const bf16* last = reinterpret_cast<const bf16*>(p.gath) + (size_t)((Mh - 1) / p.rq) * kDim;
     n = n_steps;
     if (n >= (uint64_t)ops::kInSlots) wait_done(n - ops::kInSlots);
-    const int32_t t = hist[a + M - 1];
+    const int32_t t = hist[a + M - 1] < 0 ? 129264 : hist[a + M - 1];  // vision: -1 marks an image position
     next_in(n, 1, a + M - 1, &t, *sp);
     ops::step_in(in_h, in_ctr, fb, in_d, st);
     if (head_coded) dsk::gemv_bf16x_norm(last, norm_w, kNormEps, 1, head, kVocabPart, kDim, logits, nullptr, chead, st);

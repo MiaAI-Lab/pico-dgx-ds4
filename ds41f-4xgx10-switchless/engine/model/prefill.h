@@ -45,6 +45,7 @@ struct PLayer {
 struct Prefill {
   int cap = 0, Q = 0;        // Q = q_rows(cap)
   int rq = 0, r0 = 0, n = 0;  // the chunk in progress: rows per rank, this rank's first row and count
+  int a_cur = 0;              // vision: the chunk's (or the replay's) first position
   // this rank's rows (row 0 = the chunk's row r0)
   bf16 *x, *mid, *y, *yraw, *sub;
   // the mixes: the attention's own (post, comb) and the FFN's pre (from x), the FFN's own and the next
