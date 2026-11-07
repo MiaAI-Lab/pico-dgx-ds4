@@ -11,7 +11,7 @@
 
 ```
   ♡  a fork of blaesus/dsgx10 that lets many people share one 4-Spark DeepSeek  ♡
-     same single-user speed  ·  2.5x the multi-user throughput  ·  1M context
+     same single-user speed  ·  2x+ the multi-user throughput  ·  1M context  ·  images
 ```
 
 > [!TIP]
@@ -28,16 +28,21 @@
 ┌──────────────────────────┬──────────────┬──────────────┬────────────┐
 │ metric                   │ upstream     │ pico-dgx-ds4 │ sglang tp4 │
 ├──────────────────────────┼──────────────┼──────────────┼────────────┤
-│ chat, 1 user             │ 80           │ 80           │ 64         │
-│ code, 1 user             │ 140          │ 138          │ 117        │
-│ 8 users, total           │ ~170         │ 330          │ 280        │
-│ 16 users, total          │ 177          │ 438          │ 427        │
-│ agents (8 x 80-300K ctx) │ ~150         │ 260          │ -          │
+│ chat, 1 user             │ 80           │ 82           │ 64         │
+│ code, 1 user             │ 140          │ 144          │ 117        │
+│ 8 users, distinct        │ -            │ 300          │ -          │
+│ 16 users, distinct       │ -            │ 380          │ -          │
+│ 16 users, copies         │ 177          │ 438          │ 427        │
+│ agents (8 x 80-300K ctx) │ ~150         │ 266          │ -          │
 │ prefill                  │ 10k          │ 10k          │ 5.3k       │
 │ max context              │ 256K         │ 1M           │ 1M         │
-│ quality (qeval /75)      │ 71           │ 71 (c4, c16) │ 70         │
+│ images                   │ no           │ yes          │ -          │
+│ quality (qeval /75)      │ 71           │ 71-72        │ 70         │
 └──────────────────────────┴──────────────┴──────────────┴────────────┘
   tok/s · 4x DGX Spark, TP4 over a 200G RoCE switch · single-user = 9-run medians
+  distinct = a different prompt per user; copies = prompts repeated (shares experts
+  and drafts, ~15% higher). Upstream and sglang were only measured with copies.
+  All numbers are our own bench, not sparkDash.
 ```
 
 ## ✧ what changed
