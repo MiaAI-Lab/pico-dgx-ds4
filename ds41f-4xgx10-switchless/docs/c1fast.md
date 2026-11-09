@@ -1,6 +1,7 @@
 # c1fast: single-stream decode (chat target 100 tok/s, our bench 9-run median, temp 0)
 
-STATUS (2026-11-09 05:52 UTC): DEPLOYED c1c + DSGB10_RELAX_P=0.003 DSGB10_RELAX_THRESH=0.05. Target met on prod:
+STATUS (2026-11-09 14:25 UTC): REMOVED. Relaxed accept is lossy and was taken out of production; the served build is
+the exact path (chat c1 80.1, code c1 138.4 measured 14:27 UTC). Kept below as a record. Previously (05:52 UTC): DEPLOYED c1c + DSGB10_RELAX_P=0.003 DSGB10_RELAX_THRESH=0.05. Target met on prod:
 chat c1 102.8 / code c1 162.9 (our bench, 9-run medians). Rollback:
 `cp ~/dsgx10/serve.sh.bak-pre-c1fast ~/dsgx10/serve.sh; bash ~/dsgx10/serve.sh stop; ~/dsgx10-wide/prod_up.sh`
 

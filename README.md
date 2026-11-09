@@ -28,8 +28,8 @@
 ┌──────────────────────────┬──────────────┬──────────────┬────────────┐
 │ metric                   │ upstream     │ pico-dgx-ds4 │ sglang tp4 │
 ├──────────────────────────┼──────────────┼──────────────┼────────────┤
-│ chat, 1 user (temp 0)    │ 80           │ 103 *        │ 64         │
-│ code, 1 user (temp 0)    │ 140          │ 163 *        │ 117        │
+│ chat, 1 user (temp 0)    │ 80           │ 82           │ 64         │
+│ code, 1 user (temp 0)    │ 140          │ 144          │ 117        │
 │ 8 users, distinct        │ -            │ 300          │ -          │
 │ 16 users, distinct       │ -            │ 380          │ -          │
 │ 16 users, copies         │ 177          │ 438          │ 427        │
@@ -43,9 +43,9 @@
   distinct = a different prompt per user; copies = prompts repeated (shares experts
   and drafts, ~15% higher). Upstream and sglang were only measured with copies.
   All numbers are our own bench, not sparkDash.
-  * relaxed accept (DSGB10_RELAX_P=0.003, lossy, qeval 72/75): one user at temp 0
-    only; exact (lossless) build: 82 / 144. On sparkDash 1.8.8's method: prose 145,
-    code 172 (exact build: 101 / 166; upstream README: 95 / 151).
+  Single-user numbers are the exact (lossless) build. On sparkDash 1.8.8's method:
+    prose 101, code 166 (upstream README: 95 / 151). A lossy relaxed-accept experiment
+    (103 / 163) was tried and removed: outputs must stay bit-identical.
 ```
 
 ## ✧ what changed
@@ -61,8 +61,7 @@
   1-pass drafter ..... DSGB10_DRAFT1=6, every session drafts in one pass
   cost gate .......... DSGB10_WIDE_COST, wide only when the drafts pay for it
   vision ............. image_url / base64 images via the checkpoint's own ViT (side encoder)
-  relaxed accept ..... DSGB10_RELAX_P=0.003, opt-in, one user at temp 0: a draft the model gives
-                       >= 0.3% is kept (lossy, qeval-gated); batches and sampling unchanged
+  (removed) relaxed accept: lossy single-user experiment, not part of the build (CHANGES.md #12)
 ```
 
 Per-commit details and measured before/after numbers are in [CHANGES.md](CHANGES.md); the design is in
@@ -96,12 +95,11 @@ Design, protocol and the full numbers: [docs/vision.md](ds41f-4xgx10-switchless/
 DSGB10_ENGINE_ARGS="--max-ctx 1048576 --slots 16 --big-slots 4 \
   --setenv DSGB10_BUDGET=1 --setenv DSGB10_OEA=4,12,9 \
   --setenv DSGB10_DRAFT1=6 --setenv DSGB10_WIDE=64 \
-  --setenv DSGB10_WIDE_COST=24,2.2,57,1.1 \
-  --setenv DSGB10_RELAX_P=0.003 --setenv DSGB10_RELAX_THRESH=0.05"
+  --setenv DSGB10_WIDE_COST=24,2.2,57,1.1"
 ```
 
 The full 4-Spark setup (switch, kernel, weights, serve, benchmarks) is in its companion repo,
-**spark-deepseek-setup**. Drop `DSGB10_OEA`, `DSGB10_RELAX_P` and `DSGB10_RELAX_THRESH` for a strictly lossless build
+**spark-deepseek-setup**. Drop `DSGB10_OEA` for a strictly lossless multi-user build
 (details: [docs/c1fast.md](ds41f-4xgx10-switchless/docs/c1fast.md)). For images, start the encoder
 (`tools/vision/vision_encoder.py`, see [docs/vision.md](ds41f-4xgx10-switchless/docs/vision.md#running-it)) and add
 `--vision-addr 127.0.0.1:18950` to the front-end's arguments.
@@ -110,7 +108,7 @@ The full 4-Spark setup (switch, kernel, weights, serve, benchmarks) is in its co
 
 ```
   engine, kernels, RoCE ring, drafter ...... Andy Shu, blaesus/dsgx10 (MIT)  ♡ thank you
-  multi-user, 1M context, wide step, relax .. Pico (Patrick Moorhead), this fork
+  multi-user, 1M context, wide step ........ Pico (Patrick Moorhead), this fork
 ```
 
 The upstream LICENSE and NOTICE are unchanged and cover this fork. Upstream's README follows.
