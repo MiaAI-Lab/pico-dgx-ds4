@@ -181,14 +181,22 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
   cfg.pos_end = pos_end;
   cfg.gate = c.spec_gate;
   std::copy(c.spec_row_ms, c.spec_row_ms + model::ops::kDrafts + 1, cfg.step_ms);
+  // c1fast: DSGB10_RELAX_THRESH=T: a greedy one-session decode verifies drafts while survival >= T (fixed), the gate
+  // that pairs with DSGB10_RELAX's relaxed accept (sample.cu); sampled requests and batch steps keep the default gate
+  static const float relax_thresh = [] {
+    const char* v = getenv("DSGB10_RELAX_THRESH");
+    return v ? (float)atof(v) : -1.f;
+  }();
+  const bool rgate = relax_thresh >= 0.f && !(c.sp.temperature > 0.f);
+  auto gate_of = [&] { return rgate ? relax_thresh : rate.thresh(c); };
   auto verify = [&](int bound) {
-    cfg.thresh = rate.thresh(c);
+    cfg.thresh = gate_of();
     e.gate(cfg.thresh);
     return m.launch_verify(c.sp, cfg, std::min(bound, c.limit - 1));
   };
   std::vector<int32_t> toks{c.tokens[0]};  // tok_0, tok_1, ...: positions pos0, pos0 + 1, ...
   int next_snap = c.snap_every > 0 ? (c.pos0 / c.snap_every + 1) * c.snap_every : INT32_MAX;
-  cfg.thresh = rate.thresh(c);
+  cfg.thresh = gate_of();
   e.gate(cfg.thresh);
   const uint64_t first = m.launch_spec(1, c.pos0, c.tokens, c.sp, cfg);
   int launched = 1, prev_rows = 1;

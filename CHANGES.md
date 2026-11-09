@@ -42,3 +42,13 @@ Engine args for the last row: `--max-ctx 1048576 --slots 16 --big-slots 4 --sete
 | # | Change | Files | Default | Lossless | Before -> after |
 |---|---|---|---|---|---|
 | 11 | Image input: side encoder (the checkpoint's `inference/vision.py` + `image_processor.py`, SDPA on contiguous 4D views: MATH -> flash, 3.1 s -> 0.39 s per 444-token image); dsfront `--vision-addr` accepts `image_url`/`image` parts, expands each placeholder into its span; SUBMIT flag 8 carries the spans' rows; prefill injects them, span rows route with `ffn.gate.bias_vl`, Engram dead on spans; decode untouched | `tools/vision/`, `frontend/src/{vision,server,protocol,main}.rs`, `engine/common/frontend_protocol.h`, `engine/model/{prefill,model,ops}.cu`, `engine/server/{serve,cmd}.cpp`, `engine/engram/hash.cpp` | off (needs `--vision-addr`) | text: same path | images refused (400) -> 15/15 image checks, ~0.26 s TTFT per image; text: chat/code c1 79.7/138.4 -> 81.9/144.4, distinct c16 367 -> 380, agent 260 -> 266, qeval 71/71 -> 71/72, needle 948K 3/3 (noise) |
+
+## Single user (c1fast)
+
+| # | Change | Files | Default | Lossless | Before -> after |
+|---|---|---|---|---|---|
+| 12 | Relaxed accept for one-session greedy decode (`DSGB10_RELAX_P=P`: a draft the target gives >= P probability is kept as the row's token; `DSGB10_RELAX=G` logit-gap form) + `DSGB10_RELAX_THRESH=T` fixed verify gate for one-session greedy decodes. Batch steps and sampled requests keep exact accept and the default gate | `engine/model/sample.cu`, `engine/server/cmd.cpp` | off | **no** | with P=0.003, T=0.05: chat c1 81.6 -> 102.8, code c1 140.1 -> 162.9 (our bench, 9-run medians); sparkDash prose 101 -> 145, code 166 -> 172; qeval c1/c4/c16 72/71/71; distinct c16 381, copies 434, distinct c8 311, agent 260 (vis1 same day 262), needle 948K 3/3, images 15/15 |
+
+Method check (sparkDash 1.8.8 at 754f40a, upstream's own sdrun.mjs harness): upstream's README 95 / 151 vs our 80 / 140
+was the method (one easier prompt, 256 tokens), not the engine: the exact build scores 101 / 166 on sparkDash. Full
+sweep and profile: [docs/c1fast.md](ds41f-4xgx10-switchless/docs/c1fast.md).

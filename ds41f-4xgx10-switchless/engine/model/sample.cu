@@ -2,6 +2,8 @@
 // reduces this rank's 32320 logits of the row to a RowCand, the consumer half picks the token from the
 // four RowCands in rank order, so every rank picks the same one.
 #include <climits>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 
 #include "attn/launch.h"
@@ -28,6 +30,8 @@ struct RowCand {   // one rank's view of one row
   int32_t n;       // candidates
   float v[kCand];  // their logits, descending (ties: ascending id)
   int32_t id[kCand];
+  float dl;        // c1fast: the logit of row b + 1's draft when this rank holds its id (-inf: not here)
+  int32_t pad_[3];
 };
 static_assert(sizeof(RowCand) % 16 == 0, "RowCand");
 constexpr int kHdr = 16;  // rank 0's control word, padded
@@ -107,7 +111,7 @@ constexpr int sample_grid() { return RB < 16 ? RB : 16; }
 template <int RB>
 __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const float* logits, int vocab0,
                                                      const StepIn* in, const uint32_t* ctl, SampleOut* outs,
-                                                     int32_t* fb, uint32_t* counter, SpecState* ss) {
+                                                     int32_t* fb, uint32_t* counter, SpecState* ss, float relax, float lpmin) {
   __shared__ float sv[32];
   __shared__ int si[32];
   __shared__ int hist[257];
@@ -236,6 +240,12 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
     }
     __syncthreads();
     if (t == 0) {
+      float dl = -INFINITY;
+      if (relax > 0.f && greedy && ss && in->spec == kSpecVerify && !in->sbatch && b + 1 < R) {
+        const int d = in->tokens[b + 1];
+        if (d >= vocab0 && d < vocab0 + kVocabPart) dl = logits[(size_t)b * kVocabPart + (d - vocab0)];
+      }
+      mine->dl = dl;
       mine->m = m, mine->mi = mi, mine->z = z;
       mine->gv = gv, mine->gi = gi, mine->gl = greedy ? 0.f : s_gl;
       mine->t = tcut, mine->n = nc;
@@ -244,6 +254,7 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
     mine->m = -INFINITY, mine->mi = INT_MAX, mine->z = 0.f;
     mine->gv = -INFINITY, mine->gi = INT_MAX, mine->gl = 0.f;
     mine->t = -INFINITY, mine->n = 0;
+    mine->dl = -INFINITY;
   }
   if (PER > 1) __syncthreads();  // wide64: the block's shared memory serves the next row
   }
@@ -342,6 +353,16 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
         }
         tok = ui[pick], val = uv[pick], lp = uv[pick] * invT - logZ;
       }
+      // c1fast (DSGB10_RELAX, lossy, greedy one-session verify steps only): row b + 1's draft becomes row b's
+      // token when its logit is within relax of the max, so the verdict accepts it
+      if (relax > 0.f && greedy && tok == Mi) {
+        float D = -INFINITY;
+        for (int r = 0; r < kRanks; ++r) D = fmaxf(D, all_[r].dl);
+        if (D > -INFINITY && M - D <= relax && D - logZ >= lpmin) {
+          const int d = in->tokens[b + 1];
+          if (d != tok) tok = d, val = D, lp = D * invT - logZ;
+        }
+      }
       o.row[b] = SampleRow{tok, lp, val, fl};
       fb[b] = tok;
       for (int i = 0; i < n_top; ++i) {
@@ -412,16 +433,29 @@ __global__ void __launch_bounds__(kThreads) k_sample(comm::DevChannel ch, const 
 
 void sample(const comm::DevChannel& ch, const float* logits, int vocab0, const StepIn* in, const uint32_t* ctl,
             SampleOut* outs, int32_t* fb, uint32_t* counter, cudaStream_t s, SpecState* ss, int max_rows) {
+  // c1fast: DSGB10_RELAX=G (logit gap) and/or DSGB10_RELAX_P=P (the draft's probability floor); either on turns the
+  // relaxed accept on, both must hold when both are set
+  static const float lpmin = [] {
+    const char* e = getenv("DSGB10_RELAX_P");
+    return e && atof(e) > 0. ? (float)log(atof(e)) : -INFINITY;
+  }();
+  static const float relax = [] {
+    const char* e = getenv("DSGB10_RELAX");
+    float v = e ? (float)atof(e) : 0.f;
+    if (!(v > 0.f) && lpmin > -INFINITY) v = INFINITY;
+    if (v > 0.f) fprintf(stderr, "sample: DSGB10_RELAX=%g DSGB10_RELAX_P lp>=%g: greedy one-session drafts accepted near the max (lossy)\n", v, lpmin);
+    return v;
+  }();
   if (kBytes<kMaxRows> > ch.cap) die("sample: %u bytes exceed the channel's %u", kBytes<kMaxRows>, ch.cap);
   if (max_rows == kLowRows)
     attn::launch(k_sample<kLowRows>, dim3(kLowRows), dim3(kThreads), 0, s, true, ch, logits, vocab0, in, ctl, outs, fb,
-                 counter, ss);
+                 counter, ss, relax, lpmin);
   else if (max_rows == kDecodeRows)
     attn::launch(k_sample<kDecodeRows>, dim3(kDecodeRows), dim3(kThreads), 0, s, true, ch, logits, vocab0, in, ctl, outs,
-                 fb, counter, ss);
+                 fb, counter, ss, relax, lpmin);
   else if (max_rows == kMaxRows)
     attn::launch(k_sample<kMaxRows>, dim3(sample_grid<kMaxRows>()), dim3(kThreads), 0, s, true, ch, logits, vocab0, in, ctl,
-                 outs, fb, counter, ss);
+                 outs, fb, counter, ss, relax, lpmin);
   else
     die("sample: max_rows %d (%d, %d or %d)", max_rows, kLowRows, kDecodeRows, kMaxRows);
 }
