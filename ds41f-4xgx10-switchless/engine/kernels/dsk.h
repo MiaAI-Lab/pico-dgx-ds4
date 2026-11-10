@@ -145,6 +145,10 @@ void gemv_bf16x(const __nv_bfloat16* x, int M, const uint8_t* X, int N, int K, f
                 cudaStream_t st);
 void gemv_bf16x_norm(const __nv_bfloat16* x, const __nv_bfloat16* norm_w, float eps, int M, const uint8_t* X, int N, int K,
                      float* yf, __nv_bfloat16* yb, GemvCfg cfg, cudaStream_t st);
+// stack4 (the certified head): gemv_bf16x_norm (mt 2, M <= 8, fp32 out) for the CTAs (cfg.wn * 16 output rows each) whose
+// byte of mask is non-zero: those outputs are gemv_bf16x_norm's bits; the other CTAs touch nothing.
+void gemv_bf16x_norm_masked(const __nv_bfloat16* x, const __nv_bfloat16* norm_w, float eps, int M, const uint8_t* X, int N,
+                            int K, float* yf, GemvCfg cfg, const uint8_t* mask, cudaStream_t st);
 // wide64, the coded-head GEMM: gemv_bf16x_norm (coded) / gemv_bf16_norm over M <= 64 rows, fp32 out, the weights read
 // once for every group of 16 rows; the bits of calls of 16 rows in row order (M <= 16: that call).
 void gemv_bf16_norm_rows(const __nv_bfloat16* x, const __nv_bfloat16* norm_w, float eps, int M, const uint8_t* W,

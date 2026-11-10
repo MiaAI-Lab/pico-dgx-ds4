@@ -116,6 +116,7 @@ struct SampleOut {
   int32_t next_tok[kMaxRows];
   int32_t drafts[kDrafts];
   float survival[kDrafts];
+  float cf[16];  // stack4: the confidence MLP's inputs of this draft pass (shipped logits, margins, log p1; 5 each)
   uint32_t probe[kProbeWords];  // EXPERIMENT (Options::tree_probe): the draft pass's dspark::ProbeOut
   // Batch spec steps (StepIn::sbatch): entry k's rows of this step and the device's choice for its next
   int32_t sess_row0[kMaxSess], sess_step_rows[kMaxSess];  // its rows: row[sess_row0 .. sess_row0 + sess_step_rows)

@@ -40,6 +40,9 @@ inline constexpr int kDim = 5120, kHc = 4, kQLora = 1280;
 inline constexpr int kVocab = 129280, kVocabRank = kVocab / kRanks, kMarkov = 256;
 inline constexpr int kExperts = 128, kTopK = 3, kNoiseToken = 128799;
 inline constexpr int kMainK = 3 * kDim;  // main_hidden: the inputs of layers 37, 38, 39, concatenated
+// stack4: the confidence MLP's shape (Draft::enable_cf): 3 scalars a depth in, one hidden layer, a logit a depth out
+inline constexpr int kCfIn = 3 * kDraft, kCfHid = 64;
+inline constexpr int kCfWords = 2 * kCfIn + kCfHid * kCfIn + kCfHid + kDraft * kCfHid + kDraft + kDraft;
 
 // One block's tensors on this rank (docs/layout.md: names, cuts and tile layouts).
 struct BlockW {
@@ -91,6 +94,9 @@ void head_fp8(const uint8_t* head, uint8_t* q, uint8_t* s, cudaStream_t st);
 // then gives the simulation's logits bit for bit. q: kVocabRank * kDim / 2 bytes, s: kVocabRank * kDim / 32.
 // Synchronous (bind time); dies if a group has no such scale up to 2. Returns the groups whose scale moved.
 long head_fp4(const uint8_t* head8, const uint8_t* head8_s, uint8_t* q, uint8_t* s, cudaStream_t st);
+// stack4 (the certified head): per vocabulary row n of the slice, acc[3n .. 3n + 2] += the sums over k of
+// (w - w8)^2, w^2 and w8^2 (w the bf16 head, w8 the FP8 copy's value): acc [3 * kVocabRank] doubles, zeroed by the caller.
+void head_fp8_bound(const uint8_t* head, const uint8_t* q, const uint8_t* s, double* acc, cudaStream_t st);
 // Weights::markov8 from the bf16 Markov head slice (L2 tiles): sim_fp8_l2's values (e4m3 under a power-of-two
 // scale per 32x32 block, amax / 448 rounded up), each group of 8 rows as markov_kernel's lanes read it ([4]
 // [32 lanes][16 B]: lane l's piece p, row l / 4's k = 64p + 8(l % 4) + i, then 64p + 32 + 8(l % 4) + i,
@@ -248,6 +254,13 @@ class Draft {
   // Weights::head_coded from now on (the runner's head coded in place after the module was made); before any
   // draft() a graph captures.
   void set_head_coded(const uint8_t* hc) { w_.head_coded = hc; }
+  // stack4: a learned confidence gate for one-session drafts (draft() only; batch passes keep the shipped head).
+  // After the Markov chain every rank reduces each depth's biased logits to (max, second max, sum of exp(v - max)), one
+  // all-gather brings the ranks' records together, and a small MLP on [shipped logit, top-1 margin, top-1 log p] of
+  // the 5 depths replaces confidence() / survival(). w: kCfWords floats (mu, sd, w1, b1, w2, b2, a), copied. Before any
+  // capture of draft(). dbg 1 / 2: survival() carries the margins / the log p instead (measurement only).
+  void enable_cf(const float* w, int dbg);
+  const float* cf_raw() const { return cf_w_ ? cf_raw_ : nullptr; }  // device [16]: the MLP's inputs of the last draft()
 
   // EXPERIMENT, bench only (docs/engine.md, "Draft trees"; ProbeOut): enable_probe() once, before any capture
   // of probe(). After draft(), probe(path) runs the Markov chain again along path (kDraft tokens on the device,
@@ -287,6 +300,8 @@ class Draft {
   // EXPERIMENT, bench only (the draft pass study): DSPARK_VROWS, the vocabulary rows the FP8 head GEMV and the
   // Markov chain cover (a multiple of 64; the pass's time with a vocabulary subset of 4x that, not its drafts)
   int vrows_ = kVocabRank;
+  float *cf_w_ = nullptr, *cf_rec_ = nullptr, *cf_grec_ = nullptr, *cf_raw_ = nullptr;  // stack4: the confidence MLP (enable_cf)
+  int cf_dbg_ = 0;
   Buf* b_;
   int* ids_;
   float* conf_;

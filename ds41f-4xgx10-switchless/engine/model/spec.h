@@ -24,6 +24,7 @@ struct Spec {
   std::vector<void*> whole;      // the drafter's mHC projections and router rows (gathered at bind), FP8 head
   float2* rope = nullptr;        // RoPE without YaRN, max_ctx + 8 positions (drafts run 5 past the anchor)
   uint16_t* mh = nullptr;        // main_hidden [kMaxRows][15360] of a spec step's rows
+  uint16_t* mhd = nullptr;       // stack4 (DSGB10_MH_DUMP): pinned [kOutSlots][kMaxSessRows][15360], the steps' rows of mh
   ops::SpecState* ss = nullptr;  // device [kMaxSess]: [0] the one-session step's; a batch step's entry k's is [k]
   // a spec step per context bucket: spec_in, a switch over the row count (body R - 1: R rows), then the
   // sampling with the verdicts, accept, draft and spec_next

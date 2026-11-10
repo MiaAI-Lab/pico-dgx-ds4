@@ -375,6 +375,20 @@ __global__ void __launch_bounds__(512, 1) k_gemv16_r16(const __nv_bfloat16* __re
   gemv16_body<FMT, MT, false, NORM, kMaxRows>(x, M, W, S, N, K, group_rows, yf, yb, q, qs, wn, wk, nin);
 }
 
+// stack4 (the certified head): k_gemv16 for the CTAs whose mask byte is set; the others return without reading a weight
+// or writing an output. A CTA that runs is gemv16_body, the kernel's own arithmetic for its rows.
+template <int FMT, int MT, bool NORM>
+__global__ void __launch_bounds__(512) k_gemv16_masked(const uint8_t* __restrict__ mask, const __nv_bfloat16* __restrict__ x,
+                                                        int M, const uint8_t* __restrict__ W,
+                                                        const uint8_t* __restrict__ S, int N, int K, int group_rows,
+                                                        float* __restrict__ yf, __nv_bfloat16* __restrict__ yb,
+                                                        uint8_t* __restrict__ q, uint8_t* __restrict__ qs, int wn, int wk,
+                                                        NormIn nin) {
+  pdl_wait();
+  if (!mask[blockIdx.x]) return;
+  gemv16_body<FMT, MT, false, NORM, kLowRows>(x, M, W, S, N, K, group_rows, yf, yb, q, qs, wn, wk, nin);
+}
+
 template <int FMT, int MT, bool CC, bool NORM, int RB>
 constexpr auto gemv16_kernel() {
   if constexpr (RB == kLowRows) return k_gemv16<FMT, MT, CC, NORM>;
@@ -888,6 +902,24 @@ void gemv_bf16x_norm(const __nv_bfloat16* x, const __nv_bfloat16* norm_w, float 
     case 2: launch16<kBF16X, 2, false, true>(nullptr, M, X, nullptr, N, K, N, yf, yb, nullptr, nullptr, cfg, st, nin); break;
     default: die("gemv_bf16x_norm: mt=%d", cfg.mt);
   }
+}
+
+void gemv_bf16x_norm_masked(const __nv_bfloat16* x, const __nv_bfloat16* norm_w, float eps, int M, const uint8_t* X, int N,
+                            int K, float* yf, GemvCfg cfg, const uint8_t* mask, cudaStream_t st) {
+  if (M < 1 || M > kLowRows || cfg.mt != 2 || cfg.wn * cfg.wk > 16 || K % 256)
+    die("gemv_bf16x_norm_masked: unsupported call M=%d K=%d mt=%d", M, K, cfg.mt);
+  const NormIn nin{x, norm_w, eps, nullptr, nullptr, nullptr};
+  const int rows_cta = cfg.wn * 8 * 2;
+  if (N % rows_cta) die("gemv_bf16x_norm_masked: N=%d not a multiple of %d", N, rows_cta);
+  const size_t smem = (size_t)std::max(cfg.wk * kLowRows * rows_cta, 256 + kLowRows) * sizeof(float) + (size_t)M * (K + 32) * 2;
+  static size_t attr = 48 * 1024;
+  if (smem > attr) {
+    CUDA_CHECK(cudaFuncSetAttribute(k_gemv16_masked<kBF16X, 2, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+    attr = smem;
+  }
+  launch_pdl(k_gemv16_masked<kBF16X, 2, true>, dim3(N / rows_cta), dim3(32 * cfg.wn * cfg.wk), smem, st, cfg.pdl, mask,
+             (const __nv_bfloat16*)nullptr, M, X, (const uint8_t*)nullptr, N, K, N, yf, (__nv_bfloat16*)nullptr,
+             (uint8_t*)nullptr, (uint8_t*)nullptr, cfg.wn, cfg.wk, nin);
 }
 
 void gemv_bf16_norm_rows(const __nv_bfloat16* x, const __nv_bfloat16* norm_w, float eps, int M, const uint8_t* W,

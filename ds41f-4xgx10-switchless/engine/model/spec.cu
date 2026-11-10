@@ -88,8 +88,10 @@ ops::StepSamp samp_of(const Sampling& s) { return ops::StepSamp{s.seed, s.temper
 
 // The step's input (as ops::step_in), a verify step's rows, tokens and positions from the spec state;
 // then the switch's value, the row count - 1.
+// stack4: cert_bodies > 0: the certified bodies follow the plain ones; a step takes them when every row's session is
+// greedy and asks no top logprobs (the sampler then needs the argmax alone).
 __global__ void k_spec_in(const ops::StepIn* ring, uint32_t* counter, const ops::SpecState* ss, ops::StepIn* d,
-                          cudaGraphConditionalHandle h) {
+                          cudaGraphConditionalHandle h, int cert_bodies) {
   constexpr int n = sizeof(ops::StepIn) / 4;
   static_assert(sizeof(ops::StepIn) % 4 == 0, "StepIn");
   const uint32_t slot = *counter % ops::kInSlots;
@@ -106,14 +108,33 @@ __global__ void k_spec_in(const ops::StepIn* ring, uint32_t* counter, const ops:
       }
     }
     *counter += 1;
-    cudaGraphSetConditional(h, (unsigned)(d->rows - 1));
+    int cv = 0;
+    if (cert_bodies > 0) {
+      bool ok = d->rows >= 1 && d->rows <= cert_bodies;
+      for (int r = 0; ok && r < d->rows; ++r) {
+        const ops::StepSamp& sp = d->samp[min(max(d->sess[r], 0), ops::kMaxSess - 1)];
+        ok = !(sp.temperature > 0.f) && sp.n_top <= 0;
+      }
+      if (ok) cv = cert_bodies;
+    }
+    cudaGraphSetConditional(h, (unsigned)(d->rows - 1 + cv));
   }
+}
+
+// stack4 (DSGB10_MH_DUMP, data collection only): the step's rows of main_hidden (the rejected rows' too) into the
+// pinned ring's slot of this step, for the host to write out (cmd.cpp).
+__global__ void k_mh_dump(const uint16_t* mh, const ops::StepIn* in, uint16_t* buf) {
+  const int r = blockIdx.x;
+  if (r >= in->rows) return;
+  uint16_t* d = buf + ((size_t)(in->step % ops::kOutSlots) * kMaxSessRows + r) * dspark::kMainK;
+  const uint16_t* s = mh + (size_t)r * dspark::kMainK;
+  for (int i = threadIdx.x; i < dspark::kMainK; i += blockDim.x) d[i] = s[i];
 }
 
 // After the draft pass: the drafts the next step verifies, by the gate (ops.h; at most max_drafts, its
 // rows below pos_end); then the step is published.
 __global__ void k_spec_next(const ops::StepIn* in, ops::SpecState* ss, const int* drafts, const float* surv,
-                            ops::SampleOut* outs) {
+                            ops::SampleOut* outs, const float* cf) {
   if (threadIdx.x != 0) return;
   ops::SampleOut& o = outs[in->step % ops::kOutSlots];
   const int P = ss->pos0 + ss->count;
@@ -140,6 +161,8 @@ __global__ void k_spec_next(const ops::StepIn* in, ops::SpecState* ss, const int
   o.next_pos0 = P;
   for (int j = 0; j < kMaxRows; ++j) o.next_tok[j] = ss->next_tok[j];
   for (int j = 0; j < ops::kDrafts; ++j) o.drafts[j] = drafts[j], o.survival[j] = surv[j];
+  if (cf)
+    for (int j = 0; j < 16; ++j) o.cf[j] = cf[j];
   __threadfence_system();
   st_release_sys_u32(&o.seq, in->step + 1);
 }
@@ -516,7 +539,7 @@ Spec::~Spec() {
 
 // ---- setup ------------------------------------------------------------------------------------------
 
-void Model::Impl::bind_spec(dsw::WeightFile& wf) {
+void Model::Impl::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) {
   if (!bound) die("model: bind_spec before bind");
   if (head_coded) die("model: bind_spec after code_head (the FP8 head is made from the raw head)");
   if (opt.first_layer != 0 || opt.n_layers != kLayers) die("model: DSpark needs the whole model");
@@ -527,7 +550,7 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf) {
   attn::rope_table_build(sp.rope, opt.max_ctx + 8, false, st);
   // the drafter's mHC projections and router rows whole on every rank (dspark.h BlockW): 9 collectives fewer
   // in each draft, the same bits
-  dspark::Weights dw = dspark::weights_from({&wf});
+  dspark::Weights dw = draft ? dspark::weights_from({draft, &wf}) : dspark::weights_from({&wf});
   float* hc_tmp = dalloc<float>((size_t)kMix * kHcDim);
   for (dspark::BlockW& b : dw.b) {
     for (int h = 0; h < 2; ++h) {
@@ -549,6 +572,7 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf) {
     uint8_t* s = dalloc<uint8_t>((size_t)dspark::kVocabRank * kDim / 1024);
     dspark::head_fp8(dw.head, q, s, st);
     dw.head8 = q, dw.head8_s = s;
+    cert_setup(dw.head, q, s);  // stack4: the certified head's bounds (DSGB10_CERT), while the head is raw
     if (opt.draft_head4) {  // the MXFP4 head from it, then the FP8 copy goes
       uint8_t* q4 = dalloc<uint8_t>((size_t)dspark::kVocabRank * kDim / 2);
       uint8_t* s4 = dalloc<uint8_t>((size_t)dspark::kVocabRank * kDim / 32);
@@ -557,10 +581,19 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf) {
         std::printf("draft head as MXFP4: %ld of %d groups under a scale above sim_fp4's (its e4m3 rounding)\n",
                     moved, dspark::kVocabRank * kDim / 32);
       dw.head4 = q4, dw.head4_s = s4;
-      dw.head8 = dw.head8_s = nullptr;
-      sync();
-      CUDA_CHECK(cudaFree(q));
-      CUDA_CHECK(cudaFree(s));
+      // stack4: DSGB10_HEAD4_C1=1 keeps the FP8 copy for the batch passes (dspark.cu draft_batch_head): the MXFP4 head
+      // then serves one-session drafts only, and steps of several sessions draft as without --draft-head4
+      static const bool keep8 = getenv("DSGB10_HEAD4_C1") && atoi(getenv("DSGB10_HEAD4_C1")) != 0;
+      if (keep8) {
+        sp.whole.push_back(q), sp.whole.push_back(s);
+        if (rank == 0) std::printf("draft head: MXFP4 for one-session drafts, the FP8 copy kept for batch passes\n");
+      } else {
+        if (cert.on) die("model: DSGB10_CERT needs the FP8 head copy kept (DSGB10_HEAD4_C1=1 with --draft-head4)");
+        dw.head8 = dw.head8_s = nullptr;
+        sync();
+        CUDA_CHECK(cudaFree(q));
+        CUDA_CHECK(cudaFree(s));
+      }
       sp.whole.push_back(q4), sp.whole.push_back(s4);
     } else {
       sp.whole.push_back(q), sp.whole.push_back(s);
@@ -639,8 +672,26 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf) {
   sp.draft = std::make_unique<dspark::Draft>(dw, rank, sp.comm.get(), sp.rope, nunits);
   sp.draft->use_slot(cur_unit);
   if (opt.tree_probe) sp.draft->enable_probe();
+  // stack4: DSGB10_CF_MLP=FILE (dspark::kCfWords fp32 words; the same file on every rank, or the start dies) turns the
+  // learned confidence gate of one-session drafts on; DSGB10_CF_DBG=1|2: measurement only (dspark.h enable_cf)
+  if (const char* cf = getenv("DSGB10_CF_MLP"); cf && *cf) {
+    std::string path = cf;
+    if (path.rfind("~/", 0) == 0 && getenv("HOME")) path = std::string(getenv("HOME")) + path.substr(1);
+    std::vector<float> w(dspark::kCfWords + 1);
+    FILE* f = std::fopen(path.c_str(), "rb");
+    const size_t n = f ? std::fread(w.data(), 4, w.size(), f) : 0;
+    if (f) std::fclose(f);
+    if (n != (size_t)dspark::kCfWords) die("spec: DSGB10_CF_MLP=%s: %zu words, not %d", path.c_str(), n, dspark::kCfWords);
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < n * 4; ++i) h = (h ^ reinterpret_cast<const uint8_t*>(w.data())[i]) * 16777619u;
+    const int dbg = getenv("DSGB10_CF_DBG") ? atoi(getenv("DSGB10_CF_DBG")) : 0;
+    sp.draft->enable_cf(w.data(), dbg);
+    std::fprintf(stderr, "spec: rank %d: confidence MLP %s (hash %08x, dbg %d) for one-session drafts\n", rank, path.c_str(), h, dbg);
+  }
   static_assert(kDecodeRows <= dspark::kMaxHidden, "a batch spec step's rows fit the draft module's main_hidden tap");
   sp.mh = dalloc<uint16_t>((size_t)kMaxRows * dspark::kMainK);
+  if (const char* e = getenv("DSGB10_MH_DUMP"); e && *e && rank == (getenv("DSGB10_MH_RANK") ? atoi(getenv("DSGB10_MH_RANK")) : 3))
+    sp.mhd = halloc<uint16_t>((size_t)ops::kOutSlots * kMaxSessRows * dspark::kMainK);
   sp.ss = dalloc<ops::SpecState>(ops::kMaxSess);  // [0] the one-session step's; B3's entries' [k]
   sp.bents = std::min({ops::kMaxSess, nslots, spec_wide_rows() ? ops::kMaxSess : kMaxSpecEnts});  // wide64: 16
   sp.row0 = dalloc<int>(ops::kMaxSess);
@@ -739,7 +790,8 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
   CUDA_CHECK(cudaGraphConditionalHandleCreate(&h, g, 0, 0));
   // the step's rows, and the switch's value
   CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, nullptr, nullptr, 0, mode));
-  k_spec_in<<<1, 128, 0, st>>>(in_h, in_ctr, sp.ss, in_d, h);
+  const int cert_bodies = cert.on && head_coded ? kMaxSessRows : 0;  // stack4
+  k_spec_in<<<1, 128, 0, st>>>(in_h, in_ctr, sp.ss, in_d, h, cert_bodies);
   CUDA_CHECK(cudaGetLastError());
   cudaStreamCaptureStatus cs;
   const cudaGraphNode_t* deps = nullptr;
@@ -756,20 +808,23 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
   cp.type = cudaGraphNodeTypeConditional;
   cp.conditional.handle = h;
   cp.conditional.type = cudaGraphCondTypeSwitch;
-  cp.conditional.size = kBodies;
+  cp.conditional.size = kBodies + cert_bodies;
   cudaGraphNode_t sw;
   CUDA_CHECK(cudaGraphAddNode(&sw, g, head.data(), nullptr, head.size(), &cp));
   mh_on = true;
-  for (int R = 1; R <= kBodies; ++R) {
-    CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, cp.conditional.phGraph_out[R - 1], nullptr, nullptr, 0, mode));
+  for (int i = 0; i < kBodies + cert_bodies; ++i) {  // stack4: bodies kBodies.. are the certified ones of R = i - kBodies + 1
+    const int R = i % kBodies + 1;
+    cert_cap = i >= kBodies;
+    CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, cp.conditional.phGraph_out[i], nullptr, nullptr, 0, mode));
     forward_rows(R, ctx, 0, nullptr, 0);
     CUDA_CHECK(cudaStreamEndCapture(st, &cap));
+    cert_cap = false;
   }
   mh_on = false;
   size_t nodes = 0;
-  for (int R = 1; R <= kBodies; ++R) {
+  for (int i = 0; i < kBodies + cert_bodies; ++i) {
     size_t k = 0;
-    CUDA_CHECK(cudaGraphGetNodes(cp.conditional.phGraph_out[R - 1], nullptr, &k));
+    CUDA_CHECK(cudaGraphGetNodes(cp.conditional.phGraph_out[i], nullptr, &k));
     nodes += k;
   }
   sp.nodes = nodes;
@@ -777,6 +832,7 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
   // module, the next step's rows, the publication
   CUDA_CHECK(cudaStreamBeginCaptureToGraph(st, g, &sw, nullptr, 1, mode));
   ops::sample(ch, logits, kVocabPart * rank, in_d, ctl_h, out_h, fb, samp_ctr, st, sp.ss, ops::kLowRows);
+  if (sp.mhd) k_mh_dump<<<kMaxSessRows, 256, 0, st>>>(sp.mh, in_d, sp.mhd);  // stack4: data collection
   // the step's session's windows (every entry of its slot table holds its slot)
   const int* slot = nunits > 1 ? in_d->slot : nullptr;
   sp.draft->accept(sp.mh, &sp.ss->count, &sp.ss->pos0, st, slot);
@@ -785,7 +841,7 @@ cudaGraphExec_t Model::Impl::spec_graph(int ctx) {
     sp.draft->probe(in_d->probe, st);
     k_probe_out<<<1, 128, 0, st>>>(in_d, sp.draft->probe_out(), out_h);
   }
-  k_spec_next<<<1, 32, 0, st>>>(in_d, sp.ss, sp.draft->tokens(), sp.draft->survival(), out_h);
+  k_spec_next<<<1, 32, 0, st>>>(in_d, sp.ss, sp.draft->tokens(), sp.draft->survival(), out_h, sp.draft->cf_raw());
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaStreamEndCapture(st, &cap));
   cudaGraphExec_t e;
@@ -1236,8 +1292,11 @@ uint64_t Model::Impl::launch_verify_batch(const SpecBatch& b) {
 }
 
 // ---- Model ------------------------------------------------------------------------------------------
+const uint16_t* Model::mh_dump(uint64_t n) const {
+  return d_->spec && d_->spec->mhd ? d_->spec->mhd + (size_t)(n % ops::kOutSlots) * kMaxSessRows * dspark::kMainK : nullptr;
+}
 
-void Model::bind_spec(dsw::WeightFile& wf) { d_->bind_spec(wf); }
+void Model::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) { d_->bind_spec(wf, draft); }
 int Model::spec_batch_entries() const { return d_->spec ? d_->spec->bents : 0; }
 int Model::spec_batch_rows() const { return detail::spec_row_cap(); }
 unsigned Model::spec_batch_mismatches() const {

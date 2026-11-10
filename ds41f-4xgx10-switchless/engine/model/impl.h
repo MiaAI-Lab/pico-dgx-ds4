@@ -234,6 +234,23 @@ struct Model::Impl {
   std::unique_ptr<detail::Store> store_s;
   std::unique_ptr<detail::Spec> spec;
   bool mh_on = false;  // capturing a spec step: main_hidden at the inputs of layers 37-39
+  // stack4, the certified head (DSGB10_CERT=1; one-session spec steps whose rows are all greedy without top logprobs):
+  // a coarse read of every vocabulary row (the drafter's FP8 copy of the head) with a rigorous bound per row, one
+  // cross-rank threshold per step row, and the exact head kernel on the CTAs that the bound cannot exclude. The
+  // sampler then finds the token the full head gives (cert_head, model.cu).
+  struct Cert {
+    bool on = false, check = false;
+    int force = 0;        // DSGB10_CERT_FORCE=N: every Nth step runs every CTA (the fallback, exercised)
+    float bscale = 1.f;   // DSGB10_CERT_BSCALE: the bound scaled up (more survivors; measurement)
+    const uint8_t *h8 = nullptr, *h8s = nullptr;  // the FP8 copy and its scales (dspark's)
+    float *B = nullptr, *clog = nullptr, *xn = nullptr, *logits2 = nullptr;
+    comm::ArgMax *cand = nullptr, *gcand = nullptr;
+    uint8_t* mask = nullptr;
+    uint32_t* stats = nullptr;  // steps, rows checked, mismatches, surviving CTAs (sum), max ratio bits, max CTAs, forced
+  } cert;
+  bool cert_cap = false;  // capturing a certified body
+  void cert_setup(const uint8_t* head_raw, const uint8_t* q, const uint8_t* s);
+  void cert_head(int R);
 
   Impl(int r, const Options& op);
   ~Impl();
@@ -352,7 +369,7 @@ struct Model::Impl {
   void state_snap_spec(int h, int pos);  // the draft module's windows at positions [pos - 128, pos)
 
   // ---- DSpark (spec.cu) -----------------------------------------------------------------------
-  void bind_spec(dsw::WeightFile& wf);
+  void bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft = nullptr);
   void spec_head_coded();  // code_head: the draft module's bf16 head GEMV on the coded head
   void spec_use_slot(int s);  // the draft module's eager paths act on slot s's windows
   void spec_hidden(int L, int R);  // main_hidden of the step's rows at the input of layer L

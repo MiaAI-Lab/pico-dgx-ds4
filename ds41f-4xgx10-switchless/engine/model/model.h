@@ -194,7 +194,7 @@ class Model {
   // launch_verify: the rows the step before chose (queued before it ends; pos_bound: their last
   // position at most, for the context bucket). A verify step's SampleOut holds the tokens it emits:
   // rows (1 + the drafts accepted) of row[], then next_* for the step after it.
-  void bind_spec(dsw::WeightFile& wf);
+  void bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft = nullptr);  // draft: mtp.* from it
   // the spec step's graph of every context bucket, captured now rather than at its first step (serve's
   // startup: ~0.2 GiB of device memory each)
   void spec_graphs();
@@ -338,6 +338,12 @@ class Model {
   float last_logit(int r) const;
   // Step graphs instantiated so far.
   int graph_count() const;
+  // stack4 (the certified head's counters; false: off): steps, rows checked against the full head, mismatches,
+  // surviving CTAs (sum), the largest |coarse - exact| / bound seen (float bits), the most CTAs of a step, forced steps
+  bool cert_stats(uint32_t out[8]) const;
+  // stack4 (DSGB10_MH_DUMP): step n's rows of main_hidden [kMaxSessRows][15360] bf16 in pinned memory (valid once
+  // wait(n) returned, until step n + 4 runs); null: off or not this rank
+  const uint16_t* mh_dump(uint64_t n) const;
 
   int rank() const;
   cudaStream_t stream() const;

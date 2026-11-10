@@ -904,6 +904,12 @@ class Server {
     f.sp.top_p = h.top_p;
     f.sp.top_k = (int32_t)std::min<uint32_t>(h.top_k, 1u << 30);
     f.sp.n_top = (h.flags & fe::kFlagLogprobs) ? (int32_t)std::min<uint32_t>(h.n_top_logprobs, model::ops::kTopLogprobs) : 0;
+    // stack4: a request that wants logprobs keeps the full head (the certified head gives the argmax, not the partition sum)
+    if ((h.flags & fe::kFlagLogprobs) && f.sp.n_top < 1) f.sp.n_top = 1;
+    {  // stack4 (DSGB10_FORCE_NTOP, measurement only): every request's rows carry their top logprobs in SampleOut (the step log)
+      static const int force_ntop = getenv("DSGB10_FORCE_NTOP") ? atoi(getenv("DSGB10_FORCE_NTOP")) : 0;
+      if (force_ntop > 0) f.sp.n_top = std::min(force_ntop, (int)model::ops::kTopLogprobs);
+    }
     f.sp.seed = (h.flags & fe::kFlagSeed) ? h.seed : rng_();
     flying_.insert(h.session_id);
     if (go(f, false)) {  // it decodes in the next run, first

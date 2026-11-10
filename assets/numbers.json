@@ -3,7 +3,7 @@
   "subtitle": "DeepSeek V4.1 Flash on 4x DGX Spark  ·  dsgx10 fork  ·  1M context  ·  images",
   "stats": [
    [
-    "82/144",
+    "80/142",
     "chat/code, 1 user, tok/s"
    ],
    [
@@ -56,13 +56,19 @@
   {
    "file": "c1.png",
    "title": "1 user: decode tok/s",
-   "sub": "9-run medians · temp 0 · our bench (not sparkDash) · exact (lossless) build",
+   "sub": "27-run medians · temp 0 · our bench (not sparkDash) · same binary, same hour",
    "rows": [
     [
      "pico-dgx  code",
-     144.4,
-     "lossless",
+     142.4,
+     "stack4",
      true
+    ],
+    [
+     "  before  code",
+     136.6,
+     "exact",
+     false
     ],
     [
      "upstream  code",
@@ -78,9 +84,15 @@
     ],
     [
      "pico-dgx  chat",
-     81.9,
-     "lossless",
+     80.1,
+     "stack4",
      true
+    ],
+    [
+     "  before  chat",
+     79.6,
+     "exact",
+     false
     ],
     [
      "upstream  chat",
@@ -94,7 +106,8 @@
      "",
      false
     ]
-   ]
+   ],
+   "note": "bench medians swing ±3; paired on 320 held prompts the stack is +3.8% chat (86.2 -> 89.5), +2.1% code, same texts"
   }
  ]
 }

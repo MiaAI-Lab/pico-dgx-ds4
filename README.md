@@ -28,8 +28,10 @@
 ┌──────────────────────────┬──────────────┬──────────────┬────────────┐
 │ metric                   │ upstream     │ pico-dgx-ds4 │ sglang tp4 │
 ├──────────────────────────┼──────────────┼──────────────┼────────────┤
-│ chat, 1 user (temp 0)    │ 80           │ 82           │ 64         │
-│ code, 1 user (temp 0)    │ 140          │ 144          │ 117        │
+│ chat, 1 user (temp 0)    │ 80           │ 80           │ 64         │
+│ code, 1 user (temp 0)    │ 140          │ 142          │ 117        │
+│ chat, 320 prompts paired │ -            │ 86.2 -> 89.5 │ -          │
+│ code, 320 prompts paired │ -            │ 128.2->130.9 │ -          │
 │ 8 users, distinct        │ -            │ 300          │ -          │
 │ 16 users, distinct       │ -            │ 380          │ -          │
 │ 16 users, copies         │ 177          │ 438          │ 427        │
@@ -43,9 +45,12 @@
   distinct = a different prompt per user; copies = prompts repeated (shares experts
   and drafts, ~15% higher). Upstream and sglang were only measured with copies.
   All numbers are our own bench, not sparkDash.
-  Single-user numbers are the exact (lossless) build. On sparkDash 1.8.8's method:
-    prose 101, code 166 (upstream README: 95 / 151). A lossy relaxed-accept experiment
-    (103 / 163) was tried and removed: outputs must stay bit-identical.
+  Single-user = 27-run medians of our bench on 2026-11-10 (the exact build read 79.6 / 136.6
+    in the same hour; the medians swing by ±3 between runs). The paired rows are the proof:
+    the same 320 held-out prompts, before -> after the stack4 levers, same texts.
+  On sparkDash 1.8.8's method: prose 100.5, code 162.8; catalogs 79.5 / 130.7 / 154.0
+    (exact build, same hour: 99.1 / 162.9; 76.3 / 125.2 / 151.2). Upstream README: 95 / 151.
+  A lossy relaxed-accept experiment (103 / 163) was tried and removed.
 ```
 
 ## ✧ what changed
@@ -61,11 +66,43 @@
   1-pass drafter ..... DSGB10_DRAFT1=6, every session drafts in one pass
   cost gate .......... DSGB10_WIDE_COST, wide only when the drafts pay for it
   vision ............. image_url / base64 images via the checkpoint's own ViT (side encoder)
+  4-bit draft head ... --draft-head4 --draft-markov8 + DSGB10_HEAD4_C1=1 (one-user drafts only)
+  learned gate ....... DSGB10_CF_MLP=FILE, a small MLP decides how many drafts a step verifies
+  certified head ..... DSGB10_CERT=1, greedy steps read a coarse head + only the rows that can win
   (removed) relaxed accept: lossy single-user experiment, not part of the build (CHANGES.md #12)
 ```
 
 Per-commit details and measured before/after numbers are in [CHANGES.md](CHANGES.md); the design is in
 [docs/wide64.md](ds41f-4xgx10-switchless/docs/wide64.md).
+
+## ✧ stack4: three small single-user levers
+
+Three small changes for one user, stacked: chat +3.8 %, code +2.1 %, math +2.5 % on 320 held-out prompts, with the same
+texts. Details, proofs and what was measured but not built: [docs/stack4.md](ds41f-4xgx10-switchless/docs/stack4.md).
+
+```
+  1  4-bit draft head ...... the drafter's vocabulary head as MXFP4 and its Markov head as FP8
+                             (upstream's formats) for one-user drafts; multi-user passes keep
+                             the FP8 copy. Draft pass -0.3 ms. Drafts only propose.     +1.1 %
+  2  learned verify gate ... 15 numbers the draft pass already has (per depth: the shipped
+                             confidence, the top-1 margin, the top-1 log-probability) go
+                             through a 64-unit MLP that decides how many drafts to verify.
+                             Accepted drafts per step +5 % on chat.                     +1.1 %
+  3  certified LM head ..... greedy steps read the FP8 copy of the head for all rows, bound
+                             each row's error rigorously, and run the exact kernel only on
+                             rows that could still win. Same token, proven on 1.34 M real
+                             step rows with the full head beside it: 0 mismatches.      +1.5 %
+     (gains: chat tok/s on the 320 held prompts, each on top of the one before)
+```
+
+Honest note on "same output". Levers 1 and 3 keep every verify step as it was. Lever 2 changes which drafts get verified.
+Every token is still the full model's own top choice in the step that produced it, but this engine's logits depend slightly
+on how positions are grouped into steps, so a different grouping can flip a close call. With the shipped setting all 374
+test outputs are identical to the exact build's; with a looser setting (alpha 0.9) one of 320 changed by a word. The same
+effect already exists whenever another request shares a step.
+
+Ideas behind these, with thanks: DeepSeek's DSpark (arXiv 2607.05147), Carryover Drafting (arXiv 2609.14717), certhead
+(github.com/nickharris808/certhead) and CSV-Decode (arXiv 2511.21702), FR-Spec (arXiv 2502.14856), TVP (arXiv 2611.00588).
 
 ## ✧ vision
 
@@ -95,7 +132,10 @@ Design, protocol and the full numbers: [docs/vision.md](ds41f-4xgx10-switchless/
 DSGB10_ENGINE_ARGS="--max-ctx 1048576 --slots 16 --big-slots 4 \
   --setenv DSGB10_BUDGET=1 --setenv DSGB10_OEA=4,12,9 \
   --setenv DSGB10_DRAFT1=6 --setenv DSGB10_WIDE=64 \
-  --setenv DSGB10_WIDE_COST=24,2.2,57,1.1"
+  --setenv DSGB10_WIDE_COST=24,2.2,57,1.1 \
+  --draft-head4 --draft-markov8 --setenv DSGB10_HEAD4_C1=1 \
+  --setenv DSGB10_CF_MLP=~/cfmlp_cml.bin --setenv DSGB10_CF_ALPHA=1.0 \
+  --setenv DSGB10_CERT=1"
 ```
 
 The full 4-Spark setup (switch, kernel, weights, serve, benchmarks) is in its companion repo,
@@ -109,6 +149,8 @@ The full 4-Spark setup (switch, kernel, weights, serve, benchmarks) is in its co
 ```
   engine, kernels, RoCE ring, drafter ...... Andy Shu, blaesus/dsgx10 (MIT)  ♡ thank you
   multi-user, 1M context, wide step ........ Pico (Patrick Moorhead), this fork
+  model, DSpark drafter .................... DeepSeek
+  stack4 ideas ............................. Carryover Drafting, certhead, CSV-Decode, FR-Spec, TVP (see above)
 ```
 
 The upstream LICENSE and NOTICE are unchanged and cover this fork. Upstream's README follows.

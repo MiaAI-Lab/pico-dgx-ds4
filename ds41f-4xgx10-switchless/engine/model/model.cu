@@ -4,12 +4,15 @@
 #include "model/model.h"
 
 #include <algorithm>
+#include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 
+#include "attn/launch.h"
 #include "model/impl.h"
 #include "model/prefill.h"
 #include "model/spec.h"
@@ -957,6 +960,193 @@ void Model::Impl::forward(int R, int ctx, uint32_t flags, Sink* sink, int pos0) 
   ops::sample(ch, logits, kVocabPart * rank, in_d, ctl_h, out_h, fb, samp_ctr, st, nullptr, ops::row_budget(R));
 }
 
+// ---- stack4: the certified head ------------------------------------------------------------------------------------
+namespace {
+constexpr int kCertRowsCta = 16;                       // the head GEMV's output rows per CTA (chead: mt 2, wn 1)
+constexpr int kCertCtas = kVocabPart / kCertRowsCta;
+constexpr int kCertRows = 8;                           // step rows of a certified body, at most (argmax_rows: an even count)
+static_assert(kVocabPart % kCertRowsCta == 0 && kMaxSessRows <= kCertRows, "cert");
+
+// Row b = blockIdx.x: xn[b] = an upper bound of ||x_b||_2 (x the normed final hidden); cand[b] = this rank's largest
+// lower bound of a logit, coarse - xn B (B[v]: the row's residual norm plus the rounding slack of both kernels).
+// Block 0 clears the CTA mask and counts the step.
+__global__ void __launch_bounds__(1024) k_cert_lo(const float* C, const bf16* x, const float* B, int R, int vocab0,
+                                                  float* xn, comm::ArgMax* cand, uint8_t* mask, uint32_t* stats,
+                                                  float bscale) {
+  __shared__ float sv[1024];
+  __shared__ int si[1024];
+  const int b = blockIdx.x, t = threadIdx.x;
+  if (b == 0) {
+    for (int i = t; i < kCertCtas; i += 1024) mask[i] = 0;
+    if (t == 0) stats[0] += 1;
+  }
+  if (b >= R) {
+    if (t == 0) cand[b] = comm::ArgMax{-INFINITY, INT_MAX};
+    return;
+  }
+  float s = 0.f;
+  for (int i = t; i < kDim; i += 1024) {
+    const float v = __bfloat162float(x[(size_t)b * kDim + i]);
+    s = fmaf(v, v, s);
+  }
+  sv[t] = s;
+  __syncthreads();
+  if (t == 0) {
+    float a = 0.f;
+    for (int i = 0; i < 1024; ++i) a += sv[i];
+    si[0] = __float_as_int(sqrtf(a) * 1.001f * bscale);
+    xn[b] = __int_as_float(si[0]);
+  }
+  __syncthreads();
+  const float n = __int_as_float(si[0]);
+  __syncthreads();
+  const float* c = C + (size_t)b * kVocabPart;
+  float m = -INFINITY;
+  int mi = INT_MAX;
+  for (int i = t; i < kVocabPart; i += 1024) {
+    const float lo = c[i] - n * B[i];
+    if (lo > m) m = lo, mi = vocab0 + i;
+  }
+  sv[t] = m, si[t] = mi;
+  __syncthreads();
+  if (t == 0) {
+    for (int i = 1; i < 1024; ++i)
+      if (sv[i] > m || (sv[i] == m && si[i] < mi)) m = sv[i], mi = si[i];
+    cand[b] = comm::ArgMax{m - 1e-3f, mi};
+  }
+}
+// Row b: with g[b].v the largest lower bound over the ranks, a vocabulary row whose upper bound coarse + xn B reaches
+// it may hold the argmax: its CTA's mask byte is set. Every logit of the row becomes -inf; the masked exact GEMV then
+// writes the surviving CTAs' logits. A forced step, or a threshold or norm that is not finite, sets every CTA.
+__global__ void __launch_bounds__(1024) k_cert_mask(const float* C, const float* B, const float* xn,
+                                                    const comm::ArgMax* g, int R, float* logits, uint8_t* mask,
+                                                    uint32_t* stats, int force) {
+  const int b = blockIdx.x, t = threadIdx.x;
+  if (b >= R) return;
+  const float T = g[b].v, n = xn[b];
+  const bool forced = force > 0 && stats[0] % (uint32_t)force == 0;
+  const bool all = forced || !(fabsf(T) < INFINITY) || !(n < INFINITY);
+  if (b == 0 && t == 0 && forced) stats[6] += 1;
+  const float* c = C + (size_t)b * kVocabPart;
+  float* l = logits + (size_t)b * kVocabPart;
+  for (int i = t; i < kVocabPart; i += 1024) {
+    l[i] = -INFINITY;
+    if (all || !(c[i] + n * B[i] + 1e-3f < T)) mask[i / kCertRowsCta] = 1;
+  }
+}
+// DSGB10_CERT_CHECK: row b's maximum and its lowest id in the certified logits against the full head's (l2). The token
+// is the best (max, lowest id) over the ranks, so the certified step gives the full head's token when on every rank
+// the two agree, or the full head's maximum of this rank is below the threshold g[b].v (a lower bound of some logit, so
+// this rank does not hold the winner under either head). Anything else counts in stats[2]; stats[7] counts the rows
+// where this rank's two maxima agree. Also the largest |coarse - exact| / (xn B) (stats[4], float bits), the CTAs set.
+__global__ void __launch_bounds__(1024) k_cert_check(const float* logits, const float* l2, const float* C, const float* B,
+                                                     const float* xn, int R, const uint8_t* mask, uint32_t* stats,
+                                                     const comm::ArgMax* g) {
+  __shared__ float sv[1024], sw[1024], sr[1024];
+  __shared__ int si[1024], sj[1024];
+  const int b = blockIdx.x, t = threadIdx.x;
+  if (b == 0) {
+    int cnt = 0;
+    for (int i = t; i < kCertCtas; i += 1024) cnt += mask[i] != 0;
+    si[t] = cnt;
+    __syncthreads();
+    if (t == 0) {
+      int tot = 0;
+      for (int i = 0; i < 1024; ++i) tot += si[i];
+      stats[3] += (uint32_t)tot;
+      if ((uint32_t)tot > stats[5]) stats[5] = (uint32_t)tot;
+    }
+    __syncthreads();
+  }
+  if (b >= R) return;
+  const float* a = logits + (size_t)b * kVocabPart;
+  const float* e = l2 + (size_t)b * kVocabPart;
+  const float* c = C + (size_t)b * kVocabPart;
+  const float n = xn[b];
+  float m1 = -INFINITY, m2 = -INFINITY, rt = 0.f;
+  int i1 = INT_MAX, i2 = INT_MAX;
+  for (int i = t; i < kVocabPart; i += 1024) {
+    if (a[i] > m1) m1 = a[i], i1 = i;
+    if (e[i] > m2) m2 = e[i], i2 = i;
+    rt = fmaxf(rt, fabsf(c[i] - e[i]) / (n * B[i]));
+  }
+  sv[t] = m1, si[t] = i1, sw[t] = m2, sj[t] = i2, sr[t] = rt;
+  __syncthreads();
+  if (t == 0) {
+    for (int i = 1; i < 1024; ++i) {
+      if (sv[i] > m1 || (sv[i] == m1 && si[i] < i1)) m1 = sv[i], i1 = si[i];
+      if (sw[i] > m2 || (sw[i] == m2 && sj[i] < i2)) m2 = sw[i], i2 = sj[i];
+      rt = fmaxf(rt, sr[i]);
+    }
+    atomicAdd(stats + 1, 1u);
+    const bool same = __float_as_uint(m1) == __float_as_uint(m2) && i1 == i2;
+    if (same) atomicAdd(stats + 7, 1u);
+    else if (!(m2 < g[b].v)) atomicAdd(stats + 2, 1u);
+    atomicMax(stats + 4, __float_as_uint(rt));
+  }
+}
+}  // namespace
+
+void Model::Impl::cert_head(int R) {
+  if (R > kCertRows) die("model: a certified body of %d rows", R);
+  dsk::rmsnorm(yraw, norm_w, R, kDim, kNormEps, hfin, nullptr, nullptr, st);
+  dsk::gemv_fp8w_f32(hfin, R, cert.h8, cert.h8s, kVocabPart, kDim, cert.clog, dsk::GemvCfg{2, 1, 8}, st);
+  attn::launch(k_cert_lo, dim3(kCertRows), dim3(1024), 0, st, false, (const float*)cert.clog, (const bf16*)hfin,
+               (const float*)cert.B, R, kVocabPart * rank, cert.xn, cert.cand, cert.mask, cert.stats, cert.bscale);
+  comm::argmax_rows(ch, cert.cand, cert.gcand, kCertRows, st);  // COLLECTIVE: each row's threshold over the ranks
+  attn::launch(k_cert_mask, dim3(kCertRows), dim3(1024), 0, st, false, (const float*)cert.clog, (const float*)cert.B,
+               (const float*)cert.xn, (const comm::ArgMax*)cert.gcand, R, logits, cert.mask, cert.stats, cert.force);
+  dsk::gemv_bf16x_norm_masked(yraw, norm_w, kNormEps, R, head, kVocabPart, kDim, logits, chead, cert.mask, st);
+  if (cert.check) {
+    dsk::gemv_bf16x_norm(yraw, norm_w, kNormEps, R, head, kVocabPart, kDim, cert.logits2, nullptr, chead, st);
+    attn::launch(k_cert_check, dim3(kCertRows), dim3(1024), 0, st, false, (const float*)logits, (const float*)cert.logits2,
+                 (const float*)cert.clog, (const float*)cert.B, (const float*)cert.xn, R, (const uint8_t*)cert.mask,
+                 cert.stats, (const comm::ArgMax*)cert.gcand);
+  }
+}
+
+// The bound of every vocabulary row of this rank's slice, from the raw bf16 head and its FP8 copy (bind_spec, before the
+// head is coded): B[v] = 1.001 (||w_v - w8_v|| + K 2^-21 (||w_v|| + ||w8_v||)). Then |exact kernel's logit - FP8 kernel's|
+// <= ||x|| B[v]: Cauchy-Schwarz on the residual, and each kernel's fp32 sums within K 2^-21 sum |w x| of the true dot.
+void Model::Impl::cert_setup(const uint8_t* head_raw, const uint8_t* q, const uint8_t* s) {
+  const char* e = getenv("DSGB10_CERT");
+  if (!e || atoi(e) == 0) return;
+  if (getenv("DSGB10_RELAX") || getenv("DSGB10_RELAX_P")) die("model: DSGB10_CERT with a relaxed accept");
+  double* acc = dalloc<double>((size_t)3 * kVocabPart);
+  CUDA_CHECK(cudaMemsetAsync(acc, 0, (size_t)3 * kVocabPart * 8, st));
+  dspark::head_fp8_bound(head_raw, q, s, acc, st);
+  sync();
+  std::vector<double> h((size_t)3 * kVocabPart);
+  CUDA_CHECK(cudaMemcpy(h.data(), acc, h.size() * 8, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaFree(acc));
+  std::vector<float> B(kVocabPart);
+  double sum = 0, mx = 0;
+  for (int v = 0; v < kVocabPart; ++v) {
+    const double b = 1.001 * (std::sqrt(h[3 * v]) + kDim * 0x1p-21 * (std::sqrt(h[3 * v + 1]) + std::sqrt(h[3 * v + 2])));
+    B[v] = std::nextafter((float)b, INFINITY);
+    sum += b, mx = std::max(mx, b);
+  }
+  cert.B = dalloc<float>(kVocabPart);
+  CUDA_CHECK(cudaMemcpy(cert.B, B.data(), (size_t)kVocabPart * 4, cudaMemcpyHostToDevice));
+  cert.h8 = q, cert.h8s = s;
+  cert.clog = dalloc<float>((size_t)kCertRows * kVocabPart);
+  cert.xn = dalloc<float>(kCertRows);
+  cert.cand = dalloc<comm::ArgMax>(kCertRows);
+  cert.gcand = dalloc<comm::ArgMax>(kCertRows);
+  cert.mask = dalloc<uint8_t>(kCertCtas);
+  cert.stats = dalloc<uint32_t>(8);
+  CUDA_CHECK(cudaMemset(cert.stats, 0, 32));
+  CUDA_CHECK(cudaMemset(cert.mask, 0, kCertCtas));
+  cert.check = getenv("DSGB10_CERT_CHECK") && atoi(getenv("DSGB10_CERT_CHECK")) != 0;
+  if (cert.check) cert.logits2 = dalloc<float>((size_t)kCertRows * kVocabPart);
+  cert.force = getenv("DSGB10_CERT_FORCE") ? atoi(getenv("DSGB10_CERT_FORCE")) : 0;
+  cert.bscale = getenv("DSGB10_CERT_BSCALE") ? (float)atof(getenv("DSGB10_CERT_BSCALE")) : 1.f;
+  if (!(cert.bscale >= 1.f)) die("model: DSGB10_CERT_BSCALE below 1");
+  cert.on = true;
+  std::fprintf(stderr, "cert: rank %d: certified head on (FP8 coarse read; bound mean %.4f max %.4f; check %d force %d bscale %g)\n",
+               rank, sum / kVocabPart, mx, (int)cert.check, cert.force, cert.bscale);
+}
+
 void Model::Impl::forward_rows(int R, int ctx, uint32_t flags, Sink* sink, int pos0) {
   const bool lead = rank == 0 && sink;
   const bool inj = flags & kFlagInject, sub_in = flags & kFlagInjectSub, dumps = (flags & kFlagDump) && lead;
@@ -990,7 +1180,8 @@ void Model::Impl::forward_rows(int R, int ctx, uint32_t flags, Sink* sink, int p
   // wide64: DSGB10_HEADG (default on; 0: off) runs a wide step's head in one read of the weights (the coded-head
   // GEMM, dsk::gemv_bf16_norm_rows: the same bits as the 16-row groups below)
   static const bool headg = !getenv("DSGB10_HEADG") || atoi(getenv("DSGB10_HEADG")) != 0;
-  if (R > kDecodeRows && headg) {
+  if (cert_cap) cert_head(R);  // stack4: a certified body of the one-session spec graph
+  else if (R > kDecodeRows && headg) {
     dsk::gemv_bf16_norm_rows(yraw, norm_w, kNormEps, R, head, head_coded, kVocabPart, kDim, logits, chead, st);
   } else
   for (int r0 = 0; r0 < R; r0 += kDecodeRows) {  // wide64: the head GEMVs in groups of kDecodeRows rows
@@ -1101,6 +1292,11 @@ float Model::mark_ms(int i, int j) const {
 }
 float Model::last_logit(int r) const { return d_->out_h[d_->last_n % ops::kOutSlots].row[r].value; }
 int Model::graph_count() const { return (int)d_->graphs.size(); }
+bool Model::cert_stats(uint32_t out[8]) const {
+  if (!d_->cert.on) return false;
+  CUDA_CHECK(cudaMemcpy(out, d_->cert.stats, 32, cudaMemcpyDeviceToHost));
+  return true;
+}
 int Model::rank() const { return d_->rank; }
 cudaStream_t Model::stream() const { return d_->st; }
 

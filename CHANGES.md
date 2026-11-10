@@ -55,3 +55,26 @@ experiment; the code stays in tree, off by default, and is not used.
 Method check (sparkDash 1.8.8 at 754f40a, upstream's own sdrun.mjs harness): upstream's README 95 / 151 vs our 80 / 140
 was the method (one easier prompt, 256 tokens), not the engine: the exact build scores 101 / 166 on sparkDash. Full
 sweep and profile: [docs/c1fast.md](ds41f-4xgx10-switchless/docs/c1fast.md).
+
+
+## stack4: three small single-user levers (2026-11-10)
+
+All three act on one-session steps only; batch (multi-user) steps run as before. Proof per lever: paired runs on the same 320
+held-out prompts (same texts), GPU ms per step by rows, and the 54-prompt identity set on a test port. Design and proofs:
+[docs/stack4.md](ds41f-4xgx10-switchless/docs/stack4.md).
+
+| # | Change | Files | Default | Same output | Before -> after |
+|---|---|---|---|---|---|
+| 13 | `DSGB10_HEAD4_C1=1` with upstream's `--draft-head4 --draft-markov8`: MXFP4 drafter head and FP8 Markov head for one-session drafts, the FP8 head copy kept for batch draft passes | `engine/dspark/dspark.cu`, `engine/model/spec.cu` | off | yes: drafts only; 374/374 test outputs identical | draft pass -0.30..-0.38 ms; 320 prompts chat 86.19 -> 87.17, code 128.20 -> 129.29, math 133.70 -> 134.93; 16 distinct 363-370 (unchanged) |
+| 14 | Confidence MLP gate `DSGB10_CF_MLP=FILE`, `DSGB10_CF_ALPHA=A` (one-session drafts): per depth the shipped logit, top-1 margin and top-1 log p (a scan kernel per rank, one all-gather, one MLP kernel), 64 hidden units; trained offline on 661K anchors | `engine/dspark/dspark.{h,cu}`, `engine/model/{spec.cu,ops.h}`, `engine/server/cmd.cpp`, `tools/stack4/` | off | every token is still the verifier's top choice; the gate changes which drafts are verified, which regroups steps and can flip a close call (alpha 1.0: 374/374 identical; alpha 0.9: 319/320 held texts) | accepted drafts per step chat 1.17 -> 1.24; chat 87.17 -> 88.17, code 129.29 -> 130.50, math 134.93 -> 136.11 |
+| 15 | Certified LM head `DSGB10_CERT=1` (one-session steps whose rows are greedy without logprobs): FP8 coarse GEMV, per-row rigorous bound, cross-rank threshold, exact coded-head kernel on surviving 16-row groups (`gemv_bf16x_norm_masked`), sampler unchanged; `DSGB10_CERT_CHECK=1` runs the full head beside it | `engine/model/{model.cu,spec.cu,impl.h,model.h}`, `engine/kernels/{gemv16.cu,dsk.h}`, `engine/dspark/dspark.{h,cu}`, `engine/server/{cmd,serve}.cpp` | off | yes: same steps, same token; 1,344,416 real step rows checked on each rank, 0 mismatches, fallback exercised | head -0.18..-0.28 ms a step; chat 88.17 -> 89.45, code 130.50 -> 130.88, math 136.11 -> 137.05 |
+| - | Measurement tools: `DSGB10_STEP_LOG`, `DSGB10_FORCE_NTOP`, `DSGB10_CF_DBG`, `DSGB10_CERT_FORCE`, `DSGB10_CERT_BSCALE`, `DSGB10_MH_DUMP` | `engine/server/{cmd,serve}.cpp`, `engine/model/spec.cu` | off | - | - |
+
+Stack vs the exact build, same binary: 320 held prompts chat +3.78 %, code +2.09 %, math +2.51 %; our bench 27-run medians
+79.6 / 136.6 -> 80.1 / 142.4; sparkDash c1 prose 99.1 -> 100.5, code 162.9 -> 162.8, catalogs 76.3 / 125.2 / 151.2 ->
+79.5 / 130.7 / 154.0; 16 distinct 365-366, copies 446, 8 distinct 302, agent 262, prefill 10.0k, qeval 71 / 71, needle 3/3 at
+948K, images 15/15.
+
+Measured and not built: the target's output at a rejected row as the next draft (right 18 % of the time against the drafter's
+65 %), a vocabulary shortlist for the drafter's head (+0.3 % simulated on top of #13), 6-7 bit coarse codes for #15 (about
+0.07 ms), 7-bit packing of the FP8 dense weights (upstream's costing: no gain at the measured decode cost).

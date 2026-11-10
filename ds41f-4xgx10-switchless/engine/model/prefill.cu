@@ -27,8 +27,13 @@
 #include "model/prefill.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
 
 #include "kernels/prefill_attn.h"
+#include "dspark/dspark.h"
 #include "model/nvtx.h"
 #include "model/state.h"
 
@@ -205,6 +210,70 @@ static void dump_routes(const Prefill& p, int L, int M, cudaStream_t st) {
   std::fclose(f);
 }
 #endif
+
+
+// ---- drafter2: feature dump for drafter self-distillation (DSGB10_FEAT_DUMP=<dir>; data collection only) ----
+static const std::string& feat_dir() {
+  static const std::string d = [] {
+    const char* e = std::getenv("DSGB10_FEAT_DUMP");
+    std::string v = e ? e : "";
+    if (v.rfind("~/", 0) == 0 && std::getenv("HOME")) v = std::string(std::getenv("HOME")) + v.substr(1);
+    return v;
+  }();
+  return d;
+}
+static int feat_rank() {
+  static const int r = std::getenv("DSGB10_FEAT_RANK") ? std::atoi(std::getenv("DSGB10_FEAT_RANK")) : 3;
+  return r;
+}
+constexpr int kFeatRow = dspark::kMainK + kDim;  // bf16 values per row: main_hidden, then the final collapse
+static uint16_t *g_feat = nullptr, *g_feat_all = nullptr;
+static int g_feat_rows = 0;
+static long g_feat_ctr = 0;
+static void feat_hidden(const Prefill& p, int L, cudaStream_t st) {
+  if (g_feat_rows < p.Q) {
+    CUDA_CHECK(cudaStreamSynchronize(st));
+    if (g_feat) CUDA_CHECK(cudaFree(g_feat));
+    if (g_feat_all) CUDA_CHECK(cudaFree(g_feat_all));
+    g_feat = dalloc<uint16_t>((size_t)p.Q * kFeatRow);
+    g_feat_all = dalloc<uint16_t>((size_t)kRanks * p.Q * kFeatRow);
+    g_feat_rows = p.Q;
+  }
+  for (int r = 0; r < p.n; r += dspark::kMaxHidden) {
+    const int m = std::min(dspark::kMaxHidden, p.n - r);
+    // main_hidden writes columns [5120 * slot, +5120) of rows of stride kMainK; here rows of stride kFeatRow
+    dspark::main_hidden(U(p.x) + (size_t)r * kHcDim, m, L - 37, g_feat_all + (size_t)r * dspark::kMainK, false, st);
+    CUDA_CHECK(cudaMemcpy2DAsync(g_feat + (size_t)r * kFeatRow + (L - 37) * kDim, (size_t)kFeatRow * 2,
+                                 g_feat_all + (size_t)r * dspark::kMainK + (L - 37) * kDim, (size_t)dspark::kMainK * 2,
+                                 (size_t)kDim * 2, m, cudaMemcpyDeviceToDevice, st));
+  }
+}
+static void feat_write(const Prefill& p, const comm::DevChannel& ch, int a, int M, int rank, const int32_t* toks,
+                       cudaStream_t st) {
+  if (p.n > 0)
+    CUDA_CHECK(cudaMemcpy2DAsync(g_feat + dspark::kMainK, (size_t)kFeatRow * 2, p.yraw, (size_t)kDim * 2,
+                                 (size_t)kDim * 2, p.n, cudaMemcpyDeviceToDevice, st));
+  comm::allgather(ch, g_feat, g_feat_all, (size_t)p.Q * kFeatRow * 2, st);  // every rank, the same order
+  const long c = g_feat_ctr++;
+  if (rank != feat_rank()) return;
+  CUDA_CHECK(cudaStreamSynchronize(st));
+  char path[1024];
+  std::snprintf(path, sizeof path, "%s/c%07ld.a%d.bin", feat_dir().c_str(), c, a);
+  FILE* f = std::fopen(path, "wb");
+  if (!f) die("feat dump: cannot write %s", path);
+  const int32_t hdr[8] = {0x44465432, a, M, p.rq, 0, 0, 0, 0};
+  std::fwrite(hdr, 4, 8, f);
+  std::fwrite(toks, 4, M, f);
+  std::vector<uint16_t> h((size_t)p.rq * kFeatRow);
+  for (int r = 0; r < kRanks; ++r) {
+    const int n = std::max(0, std::min(p.rq, M - r * p.rq));
+    if (n == 0) continue;
+    CUDA_CHECK(cudaMemcpy(h.data(), g_feat_all + (size_t)r * p.Q * kFeatRow, (size_t)n * kFeatRow * 2,
+                          cudaMemcpyDeviceToHost));
+    std::fwrite(h.data(), 2, (size_t)n * kFeatRow, f);
+  }
+  std::fclose(f);
+}
 
 // ---- Engram ---------------------------------------------------------------------------------------
 
@@ -641,12 +710,14 @@ uint64_t Model::Impl::prefill(int a, int M, const Sampling* sp, int handle, cons
     if (fresh && p.n > 0)
       boundary_p(p.n, nullptr, p.x, nullptr, nullptr, p.pm, nullptr, L, 0, p.a_pre, p.a_post, p.a_comb);
     if (spec) spec_prefill_hidden(L, a, M, snap_pos);  // DSpark: main_hidden of the rows its windows take
+    if (!ced && L >= 37 && !feat_dir().empty()) feat_hidden(p, L, st);  // drafter2: feature dump
     attention_p(L, a, M, snaps);
     if ((opt.wave_probe >> L & 1) && a == opt.wave_probe_at) wave_probe(L, a, M);
     ffn_p(L, M);
   }
   p.e_pos0[set] = -1;  // used
   CUDA_CHECK(cudaEventRecord(ev_pf[1], st));
+  if (!ced && !feat_dir().empty()) feat_write(p, ch, a, M, rank, hist.data() + a, st);  // drafter2: feature dump
   if (ced) {
     ced_project(M);
     ced_keep(a, M);

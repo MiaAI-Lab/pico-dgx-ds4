@@ -457,6 +457,79 @@ __global__ void probe_merge_kernel(const float* grec, const int* path, const flo
   out->rank[j] = rank, out->p_path[j] = pp, out->conf[j] = conf[j], out->lse[j] = lse;
 }
 
+// ---- stack4: the confidence MLP (Draft::enable_cf) -----------------------------------------------------------
+// This rank's record of depth j = blockIdx.x from its biased logits dl[j]: the max, the second (the best below it in
+// better()'s order), and the sum of exp(v - max) in the block's fixed order.
+__global__ void __launch_bounds__(1024) cf_scan_kernel(const float* dl, int vbase, float* rec) {
+  __shared__ float sv[32];
+  __shared__ int si[32];
+  pdl_trigger();
+  pdl_wait();
+  const int j = blockIdx.x;
+  const float* x = dl + (size_t)j * kVocabRank;
+  float m = -INFINITY;
+  int mi = 1 << 30;
+  for (int i = threadIdx.x; i < kVocabRank; i += blockDim.x) {
+    const float v = x[i];
+    if (better(v, vbase + i, m, mi)) m = v, mi = vbase + i;
+  }
+  block_best(m, mi, sv, si);
+  float s = 0.f;
+  for (int i = threadIdx.x; i < kVocabRank; i += blockDim.x) s += expf(x[i] - m);
+  s = block_sum(s, sv);
+  float m2 = -INFINITY;
+  int m2i = 1 << 30;
+  for (int i = threadIdx.x; i < kVocabRank; i += blockDim.x) {
+    const float v = x[i];
+    if (vbase + i != mi && better(v, vbase + i, m2, m2i)) m2 = v, m2i = vbase + i;
+  }
+  block_best(m2, m2i, sv, si);
+  if (threadIdx.x == 0) rec[4 * j] = m, rec[4 * j + 1] = m2, rec[4 * j + 2] = s, rec[4 * j + 3] = 0.f;
+}
+// Every rank's records (gathered in rank order) and the shipped confidence logits -> the MLP's logits in conf[0..4] and
+// their survival in conf[8..12]. One thread, a fixed order of fp32 operations: the same bits on every rank.
+__global__ void cf_mlp_kernel(const float* grec, const float* w, float* conf, int dbg, float* rawout) {
+  pdl_trigger();
+  pdl_wait();
+  if (threadIdx.x) return;
+  float x[kCfIn], raw[kCfIn], c[kDraft];
+  for (int j = 0; j < kDraft; ++j) {
+    auto rec = [&](int r) { return grec + (r * kDraft + j) * 4; };
+    float M = -INFINITY;
+    for (int r = 0; r < kRanks; ++r) M = fmaxf(M, rec(r)[0]);
+    float S2 = -INFINITY, s = 0.f;
+    bool skipped = false;
+    for (int r = 0; r < kRanks; ++r) {
+      const float a = rec(r)[0];
+      if (a == M && !skipped) skipped = true;
+      else S2 = fmaxf(S2, a);
+      S2 = fmaxf(S2, rec(r)[1]);
+      s = __fmaf_rn(rec(r)[2], expf(a - M), s);
+    }
+    c[j] = conf[j];
+    raw[j] = c[j], raw[kDraft + j] = M - S2, raw[2 * kDraft + j] = -logf(s);
+  }
+  for (int i = 0; i < kCfIn; ++i) rawout[i] = raw[i];
+  const float *mu = w, *sd = mu + kCfIn, *w1 = sd + kCfIn, *b1 = w1 + kCfHid * kCfIn, *w2 = b1 + kCfHid,
+              *b2 = w2 + kDraft * kCfHid, *a = b2 + kDraft;
+  for (int i = 0; i < kCfIn; ++i) x[i] = __fdiv_rn(__fsub_rn(raw[i], mu[i]), sd[i]);
+  float out[kDraft];
+  for (int j = 0; j < kDraft; ++j) out[j] = b2[j];
+  for (int k = 0; k < kCfHid; ++k) {
+    float h = b1[k];
+    for (int i = 0; i < kCfIn; ++i) h = __fmaf_rn(w1[k * kCfIn + i], x[i], h);
+    h = fmaxf(h, 0.f);
+    for (int j = 0; j < kDraft; ++j) out[j] = __fmaf_rn(w2[j * kCfHid + k], h, out[j]);
+  }
+  float p = 1.f;
+  for (int j = 0; j < kDraft; ++j) {
+    const float lg = __fmaf_rn(a[j], c[j], out[j]);
+    p *= 1.f / (1.f + expf(-lg));
+    if (dbg == 0) conf[j] = lg, conf[8 + j] = p;
+    else conf[8 + j] = raw[dbg * kDraft + j];
+  }
+}
+
 // ---- STAND-IN collectives -----------------------------------------------------------------------------------
 
 struct GatherArgs {
@@ -606,6 +679,35 @@ __global__ void __launch_bounds__(256) head_fp8_kernel(const uint8_t* head, uint
 
 void head_fp8(const uint8_t* head, uint8_t* q, uint8_t* s, cudaStream_t st) {
   launch(head_fp8_kernel, dim3(kVocabRank / 32 * (kDim / 32) / 8), dim3(256), 0, st, false, head, q, s);
+}
+
+namespace {
+// head_fp8_kernel's walk (a warp per 32x32 block, lane = column) over the head and its finished FP8 copy
+__global__ void __launch_bounds__(256) head_fp8_bound_kernel(const uint8_t* head, const uint8_t* q, const uint8_t* s,
+                                                             double* acc) {
+  constexpr int N = kVocabRank, K = kDim;
+  const int blk = (blockIdx.x * 256 + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+  if (blk >= N / 32 * (K / 32)) return;
+  const int n0 = blk / (K / 32) * 32, k = blk % (K / 32) * 32 + lane;
+  const float sc = attn::ue8m0_to_f(s[blk]);
+  for (int i = 0; i < 32; ++i) {
+    const int n = n0 + i;
+    const size_t off = ((size_t)(n / 8) * (2 * K / 64) + k / 32) * 512 + (n % 8) * 64 + (k % 32) * 2;
+    const float v = bf2f(*reinterpret_cast<const uint16_t*>(head + off));
+    const float w8 = __fmul_rn(attn::e4m3_to_f(q[((size_t)(n / 8) * (K / 64) + k / 64) * 512 + (n % 8) * 64 + k % 64]), sc);
+    const float d = __fsub_rn(v, w8);
+    const float d2 = attn::warp_sum(__fmul_rn(d, d)), v2 = attn::warp_sum(__fmul_rn(v, v)), q2 = attn::warp_sum(__fmul_rn(w8, w8));
+    if (lane == 0) {
+      atomicAdd(acc + 3 * (size_t)n, (double)d2);
+      atomicAdd(acc + 3 * (size_t)n + 1, (double)v2);
+      atomicAdd(acc + 3 * (size_t)n + 2, (double)q2);
+    }
+  }
+}
+}  // namespace
+
+void head_fp8_bound(const uint8_t* head, const uint8_t* q, const uint8_t* s, double* acc, cudaStream_t st) {
+  launch(head_fp8_bound_kernel, dim3(kVocabRank / 32 * (kDim / 32) / 8), dim3(256), 0, st, false, head, q, s, acc);
 }
 
 namespace {
@@ -1016,6 +1118,25 @@ void Draft::draft(const int* token, cudaStream_t s, const int* slot) {
   tap(taps.markov_embed, b.emb, kDraft * kMarkov * 2, s);
   launch(conf_kernel<false>, dim3(1), dim3(32 * kDraft), 0, s, true, (const uint16_t*)b.hx, (const uint16_t*)b.emb,
          w_.conf, (const Cand*)b.gcand, ids_, conf_, (const int*)nullptr);
+  if (cf_w_) {  // stack4: the confidence MLP over the chain's scalars
+    launch(cf_scan_kernel, dim3(kDraft), dim3(1024), 0, s, true, (const float*)b.dl, kVocabRank * rank_, cf_rec_);
+    const GatherSeg g{cf_rec_, (size_t)kDraft * 16, cf_grec_, (size_t)kDraft * 16, (size_t)kDraft * 16, 1};
+    comm_->all_gather(&g, 1, s);  // COLLECTIVE: all-gather of the ranks' (max, second, sum exp) per depth
+    launch(cf_mlp_kernel, dim3(1), dim3(32), 0, s, true, (const float*)cf_grec_, (const float*)cf_w_, conf_, cf_dbg_, cf_raw_);
+  }
+}
+
+void Draft::enable_cf(const float* w, int dbg) {
+  if (cf_w_) return;
+  CUDA_CHECK(cudaMalloc(&cf_w_, kCfWords * 4));
+  CUDA_CHECK(cudaMemcpy(cf_w_, w, kCfWords * 4, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMalloc(&cf_rec_, kDraft * 16));
+  CUDA_CHECK(cudaMalloc(&cf_grec_, kRanks * kDraft * 16));
+  CUDA_CHECK(cudaMemset(cf_rec_, 0, kDraft * 16));
+  CUDA_CHECK(cudaMemset(cf_grec_, 0, kRanks * kDraft * 16));
+  CUDA_CHECK(cudaMalloc(&cf_raw_, 16 * 4));
+  CUDA_CHECK(cudaMemset(cf_raw_, 0, 16 * 4));
+  cf_dbg_ = dbg;
 }
 
 // ---- B3 phase 2a: one pass over several entries (docs/batching.md) ------------------------------------------------
@@ -1148,7 +1269,9 @@ void Draft::draft_batch_head(const BatchPass& p, int R, cudaStream_t s) {
   Buf& b = *b_;
   dsk::GemvCfg ch{2, 1, 16}, ch8{2, 1, 8};
   attn::hc_pre(b.bxa, b.bpre, R, w_.norm, b.bhxn, b.bhx, s, true);
-  if (w_.head4) {  // at most 8 rows a call: each entry's 5, draft()'s call
+  // stack4: with the FP8 copy kept beside the MXFP4 head (DSGB10_HEAD4_C1), passes of several entries read the FP8 copy
+  // once (the paths below) instead of the MXFP4 head once per entry; one-entry passes and draft() read the MXFP4 head
+  if (w_.head4 && (p.n == 1 || !w_.head8)) {  // at most 8 rows a call: each entry's 5, draft()'s call
     for (int q = 0; q < p.n; ++q)
       dsk::gemv_fp4w_f32(bf(b.bhxn) + (size_t)q * kDraft * kDim, kDraft, w_.head4, w_.head4_s, vrows_, kDim,
                          b.blogits + (size_t)q * kDraft * kVocabRank, ch8, s);

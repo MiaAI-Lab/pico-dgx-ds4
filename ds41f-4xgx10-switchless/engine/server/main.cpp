@@ -303,6 +303,7 @@ struct Args {
   size_t ring_cap = 4u << 20;  // the ring's per-rank collective size (prefill's bulk collectives post cap / 4)
   bool spec = false, no_spec = false, draft_fp8 = false, draft_bf16 = false, draft_head4 = false, draft_markov8 = false;
   bool head_raw = false, no_l2pf = false;
+  std::string draft_weights;  // --draft-weights FILE: the drafter (mtp.*) from this rank file instead of --weights
   int spec_drafts = 5;
   float spec_thresh = -1.f;
   float spec_cost[3] = {19.4f, 3.6f, 3.3f};
@@ -323,6 +324,7 @@ Args parse(int argc, char** argv) {
     else if (s == "--mode") a.mode = val();
     else if (s == "--golden") a.golden = val();
     else if (s == "--weights") a.weights = val();
+    else if (s == "--draft-weights") a.draft_weights = val();
     else if (s == "--hashmap") a.hashmap = val();
     else if (s == "--shard1") a.shard[0] = val();
     else if (s == "--shard14") a.shard[1] = val();
@@ -459,6 +461,7 @@ Args parse(int argc, char** argv) {
     if (v.empty()) die("no %s, and the fleet file %s has no RANK%d_%s", flag, fl.file.c_str(), a.rank, key);
   };
   path(a.weights, me.weights, "WEIGHTS", "--weights");
+  if (!a.draft_weights.empty()) a.draft_weights = comm::fleet_path(a.draft_weights, a.rank);
   if (!a.no_engram) {
     path(a.hashmap, me.hashmap, "HASHMAP", "--hashmap");
     std::string dir = me.engram;
@@ -525,6 +528,7 @@ uint64_t run_id(const Args& a) {
     h = keepfile::fnv(v, sizeof v, h);
   };
   file(a.weights);
+  if (!a.draft_weights.empty()) file(a.draft_weights);
   if (!a.no_engram) file(a.hashmap), file(a.shard[0]), file(a.shard[1]);
   const int64_t o[] = {a.max_ctx, a.exact, a.spec, a.draft_fp8, a.prefill_rows, a.small_rows, a.snap_every,
                        a.no_engram, a.layers, a.first, (int64_t)a.ring_cap, a.draft_head4, a.draft_markov8};
@@ -607,7 +611,7 @@ int main(int argc, char** argv) {
   dsw::LoadOptions lo;
   lo.threads = a.threads;
   lo.select = [&a](const dsw::DeviceTensor& t) {
-    if (t.name.rfind("mtp.", 0) == 0) return a.spec;
+    if (t.name.rfind("mtp.", 0) == 0) return a.spec && a.draft_weights.empty();
     if (t.name.rfind("layers.", 0) == 0) {
       const int L = std::atoi(t.name.c_str() + 7);
       return L >= a.first && L < a.layers;
@@ -618,7 +622,19 @@ int main(int argc, char** argv) {
   std::printf("rank %d: %.2f GiB of weights in %.1f s (%.2f GB/s)\n", a.rank, ls.bytes / 1073741824.0, ls.seconds, ls.gbps);
   m.bind(wf, ring);
   if (ring2) m.bind_ring2(*ring2);
-  if (a.spec) m.bind_spec(wf);
+  // --draft-weights: another drafter's mtp.* (same shapes and formats) from its own rank file; embed and head
+  // stay the model's. Drafts change the speed, never the tokens.
+  std::unique_ptr<dsw::WeightFile> dwf;
+  if (a.spec && !a.draft_weights.empty()) {
+    dwf = std::make_unique<dsw::WeightFile>(a.draft_weights, a.rank, comm::kRanks);
+    dsw::LoadOptions dlo;
+    dlo.threads = a.threads;
+    dlo.select = [](const dsw::DeviceTensor& t) { return t.name.rfind("mtp.", 0) == 0; };
+    const dsw::LoadStats ds = dwf->load(dlo);
+    std::printf("rank %d: drafter %s: %.2f GiB in %.1f s\n", a.rank, a.draft_weights.c_str(), ds.bytes / 1073741824.0,
+                ds.seconds);
+  }
+  if (a.spec) m.bind_spec(wf, dwf.get());
   if (!a.head_raw) {  // after bind_spec: DSpark's FP8 head comes from the raw one
     const double t1 = now_s();
     int raw = 0;

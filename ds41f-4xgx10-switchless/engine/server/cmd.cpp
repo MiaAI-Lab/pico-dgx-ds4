@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <string>
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -188,7 +189,10 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
     return v ? (float)atof(v) : -1.f;
   }();
   const bool rgate = relax_thresh >= 0.f && !(c.sp.temperature > 0.f);
-  auto gate_of = [&] { return rgate ? relax_thresh : rate.thresh(c); };
+  // stack4: DSGB10_CF_ALPHA=A scales the one-session gate's threshold (the confidence MLP's calibration differs from the
+  // shipped head's; a threshold only decides which drafts are verified, never a token)
+  static const float cf_alpha = getenv("DSGB10_CF_ALPHA") ? (float)atof(getenv("DSGB10_CF_ALPHA")) : 1.f;
+  auto gate_of = [&] { return rgate ? relax_thresh : rate.thresh(c) * cf_alpha; };
   auto verify = [&](int bound) {
     cfg.thresh = gate_of();
     e.gate(cfg.thresh);
@@ -198,6 +202,23 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
   int next_snap = c.snap_every > 0 ? (c.pos0 / c.snap_every + 1) * c.snap_every : INT32_MAX;
   cfg.thresh = gate_of();
   e.gate(cfg.thresh);
+  static FILE* const slog = [] {
+    const char* v = getenv("DSGB10_STEP_LOG");
+    return v && *v ? std::fopen(v, "a") : (FILE*)nullptr;
+  }();
+  static FILE* const mhf = [&] {  // stack4 (DSGB10_MH_DUMP=DIR on the rank that holds the pinned ring): DIR/mh.bin
+    const char* v = getenv("DSGB10_MH_DUMP");
+    if (!v || !*v || !m.mh_dump(0)) return (FILE*)nullptr;
+    std::string p = v;
+    if (p.rfind("~/", 0) == 0 && getenv("HOME")) p = std::string(getenv("HOME")) + p.substr(1);
+    return std::fopen((p + "/mh.bin").c_str(), "ab");
+  }();
+  if (mhf) {
+    const int32_t hd[4] = {-1, c.pos0, c.max_new, 0};
+    std::fwrite(hd, 4, 4, mhf);
+  }
+  std::vector<int32_t> slog_in{c.tokens[0]};
+  if (slog) std::fprintf(slog, "{\"req\":1,\"pos0\":%d,\"max_new\":%d,\"temp\":%.3f,\"n_top\":%d}\n", c.pos0, c.max_new, c.sp.temperature, c.sp.n_top);
   const uint64_t first = m.launch_spec(1, c.pos0, c.tokens, c.sp, cfg);
   int launched = 1, prev_rows = 1;
   if (c.ahead && c.pos0 + 1 <= feed) verify(c.pos0 + 1 + kD), ++launched;
@@ -207,6 +228,49 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
     wd.started = 0;
     g_t_wait.push_back(now_s());
     if (i + 1 < launched) m.engram_late(o.next_pos0, o.next_rows, o.next_tok);  // step i + 1's rows
+    if (mhf) {  // stack4: the step's rows of main_hidden
+      const int32_t hd[4] = {i, o.pos0, o.step_rows, o.rows};
+      std::fwrite(hd, 4, 4, mhf);
+      std::fwrite(m.mh_dump(first + i), 2 * 15360, (size_t)std::max(0, std::min(o.step_rows, 8)), mhf);
+    }
+    if (slog) {  // stack4 (DSGB10_STEP_LOG, measurement only): every row's sample, the rejected rows' too
+      std::fprintf(slog, "{\"i\":%d,\"p\":%d,\"R\":%d,\"n\":%d,\"in\":[", i, o.pos0, o.step_rows, o.rows);
+      for (size_t j = 0; j < slog_in.size(); ++j) std::fprintf(slog, "%s%d", j ? "," : "", slog_in[j]);
+      std::fprintf(slog, "],\"out\":[");
+      for (int j = 0; j < o.step_rows; ++j) std::fprintf(slog, "%s%d", j ? "," : "", o.row[j].token);
+      std::fprintf(slog, "],\"lp\":[");
+      for (int j = 0; j < o.step_rows; ++j) std::fprintf(slog, "%s%.4f", j ? "," : "", o.row[j].logprob);
+      std::fprintf(slog, "],\"np\":%d,\"nt\":[", o.next_pos0);
+      for (int j = 0; j < o.next_rows; ++j) std::fprintf(slog, "%s%d", j ? "," : "", o.next_tok[j]);
+      std::fprintf(slog, "],\"d\":[");
+      for (int j = 0; j < kD; ++j) std::fprintf(slog, "%s%d", j ? "," : "", o.drafts[j]);
+      std::fprintf(slog, "],\"s\":[");
+      for (int j = 0; j < kD; ++j) std::fprintf(slog, "%s%.5f", j ? "," : "", o.survival[j]);
+      std::fprintf(slog, "]");
+      static const bool slog_cf = getenv("DSGB10_CF_MLP") != nullptr;
+      if (slog_cf) {
+        std::fprintf(slog, ",\"cf\":[");
+        for (int j = 0; j < 15; ++j) std::fprintf(slog, "%s%.4f", j ? "," : "", o.cf[j]);
+        std::fprintf(slog, "]");
+      }
+      if (c.sp.n_top > 0) {
+        std::fprintf(slog, ",\"ti\":[");
+        for (int j = 0; j < o.step_rows; ++j) {
+          std::fprintf(slog, "%s[", j ? "," : "");
+          for (int k = 0; k < c.sp.n_top; ++k) std::fprintf(slog, "%s%d", k ? "," : "", o.top_id[j][k]);
+          std::fprintf(slog, "]");
+        }
+        std::fprintf(slog, "],\"tl\":[");
+        for (int j = 0; j < o.step_rows; ++j) {
+          std::fprintf(slog, "%s[", j ? "," : "");
+          for (int k = 0; k < c.sp.n_top; ++k) std::fprintf(slog, "%s%.3f", k ? "," : "", o.top_lp[j][k] > -1e30f ? o.top_lp[j][k] : -99.f);
+          std::fprintf(slog, "]");
+        }
+        std::fprintf(slog, "]");
+      }
+      std::fprintf(slog, "}\n");
+      slog_in.assign(o.next_tok, o.next_tok + std::max(0, std::min<int>(o.next_rows, model::kMaxRows)));
+    }
     g_t_late.push_back(now_s());
     e.written = std::max(e.written, o.pos0 + std::max(o.step_rows, o.rows + kD));
     if (i > 0) {
@@ -251,6 +315,16 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
     for (; next_snap <= kv_end; next_snap += c.snap_every)  // window snapshots (the ring holds s - 128 .. s - 1)
       if (c.handle >= 0 && next_snap > c.pos0 && next_snap >= 128) m.state_snap(c.handle, next_snap);
     if (stop) {
+      if (slog) std::fflush(slog);
+      if (mhf) std::fflush(mhf);
+      static const bool cert_log = getenv("DSGB10_CERT_CHECK") || getenv("DSGB10_CERT_LOG");
+      if (uint32_t cs[8]; cert_log && m.cert_stats(cs)) {
+        float ratio;
+        std::memcpy(&ratio, &cs[4], 4);
+        std::fprintf(stderr, "cert: steps %u, rows checked %u, mismatches %u, rows whose winner is on this rank or equal %u, "
+                             "surviving CTAs %u (most in a step %u), largest |coarse - exact| / bound %.4f, forced steps %u\n",
+                     cs[0], cs[1], cs[2], cs[7], cs[3], cs[5], ratio, cs[6]);
+      }
       e.fed = kv_end - c.pos0;
       e.last = toks[e.fed - 1];
       return e;
