@@ -158,6 +158,7 @@ leaves several times more rejected rows than DSpark's confidence-scheduled verif
 | identity set (54 prompts, :18901) | 54/54 | reference |
 | 320 held prompts, chat / code / math tok/s | 89.45 / 130.88 / 137.05 | 86.19 / 128.20 / 133.70 |
 | our bench, 27-run medians, chat / code | 80.1 / 142.4 | 79.6 / 136.6 |
+| our bench, 27 more runs on the live build later that day (no other traffic) | 82.7 / 142.6 | - |
 | sparkDash 1.8.8 c1 prose / code (5 runs) | 100.3-100.8 / 162.5-163.1 | 98.8-99.2 / 162.8-163.1 |
 | sparkDash catalogs prose / structural / code | 79.5 / 130.7 / 154.0 | 76.3 / 125.2 / 151.2 |
 | 16 distinct users / copies / 8 distinct | 365, 366 / 446 / 302 | 370, 366 / 434 / 298 |

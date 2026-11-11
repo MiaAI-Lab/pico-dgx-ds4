@@ -82,3 +82,6 @@ Measured and not built: the target's output at a rejected row as the next draft 
 Carryover pilot (2026-11-10, offline only): carried rejected-row states with the shipped drafter frozen raise the accepted
 length after a rejection by 2.2 % (3.5 % with small gated adapters) on 12,220 held anchors; realised speed with the current
 confidence gate is about zero, so it is not in the engine. Numbers and code: docs/stack4.md, tools/stack4/carryover/.
+
+Live build re-measured on our bench (27 runs, 2026-11-10, no other traffic): chat 82.7, code 142.6 (medians). README
+table and charts now show 83 / 143.

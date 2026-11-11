@@ -3,7 +3,7 @@
   "subtitle": "DeepSeek V4.1 Flash on 4x DGX Spark  ·  dsgx10 fork  ·  1M context  ·  images",
   "stats": [
    [
-    "80/142",
+    "83/143",
     "chat/code, 1 user, tok/s"
    ],
    [
@@ -60,7 +60,7 @@
    "rows": [
     [
      "pico-dgx  code",
-     142.4,
+     142.6,
      "stack4",
      true
     ],
@@ -84,7 +84,7 @@
     ],
     [
      "pico-dgx  chat",
-     80.1,
+     82.7,
      "stack4",
      true
     ],

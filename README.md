@@ -28,8 +28,8 @@
 ┌──────────────────────────┬──────────────┬──────────────┬────────────┐
 │ metric                   │ upstream     │ pico-dgx-ds4 │ sglang tp4 │
 ├──────────────────────────┼──────────────┼──────────────┼────────────┤
-│ chat, 1 user (temp 0)    │ 80           │ 80           │ 64         │
-│ code, 1 user (temp 0)    │ 140          │ 142          │ 117        │
+│ chat, 1 user (temp 0)    │ 80           │ 83           │ 64         │
+│ code, 1 user (temp 0)    │ 140          │ 143          │ 117        │
 │ chat, 320 prompts paired │ -            │ 86.2 -> 89.5 │ -          │
 │ code, 320 prompts paired │ -            │ 128.2->130.9 │ -          │
 │ 8 users, distinct        │ -            │ 300          │ -          │
@@ -45,8 +45,9 @@
   distinct = a different prompt per user; copies = prompts repeated (shares experts
   and drafts, ~15% higher). Upstream and sglang were only measured with copies.
   All numbers are our own bench, not sparkDash.
-  Single-user = 27-run medians of our bench on 2026-11-10 (the exact build read 79.6 / 136.6
-    in the same hour; the medians swing by ±3 between runs). The paired rows are the proof:
+  Single-user = 27-run medians of our bench on the live build, 2026-11-10: 82.7 / 142.6
+    (an earlier 27-run the same day read 80.1 / 142.4, with the exact build at 79.6 / 136.6 in
+    that hour; the medians swing by ±3 between runs). The paired rows are the proof:
     the same 320 held-out prompts, before -> after the stack4 levers, same texts.
   On sparkDash 1.8.8's method: prose 100.5, code 162.8; catalogs 79.5 / 130.7 / 154.0
     (exact build, same hour: 99.1 / 162.9; 76.3 / 125.2 / 151.2). Upstream README: 95 / 151.
