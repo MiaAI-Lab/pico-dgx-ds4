@@ -7,7 +7,7 @@
     "chat/code, 1 user, tok/s"
    ],
    [
-    "380",
+    "368",
     "16 users, distinct, tok/s"
    ],
    [
@@ -28,13 +28,13 @@
    "rows": [
     [
      "pico-dgx  distinct",
-     380.4,
+     368,
      "16 different prompts",
      true
     ],
     [
      "pico-dgx  copies",
-     438.0,
+     436,
      "same prompts repeated",
      true
     ],

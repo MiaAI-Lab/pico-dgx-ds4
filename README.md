@@ -33,8 +33,8 @@
 │ chat, 320 prompts paired │ -            │ 86.2 -> 89.5 │ -          │
 │ code, 320 prompts paired │ -            │ 128.2->130.9 │ -          │
 │ 8 users, distinct        │ -            │ 300          │ -          │
-│ 16 users, distinct       │ -            │ 380          │ -          │
-│ 16 users, copies         │ 177          │ 438          │ 427        │
+│ 16 users, distinct       │ -            │ 368          │ -          │
+│ 16 users, copies         │ 177          │ 436          │ 427        │
 │ agents (8 x 80-300K ctx) │ ~150         │ 260-266      │ -          │
 │ prefill                  │ 10k          │ 10k          │ 5.3k       │
 │ max context              │ 256K         │ 1M           │ 1M         │
@@ -51,6 +51,8 @@
     the same 320 held-out prompts, before -> after the stack4 levers, same texts.
   On sparkDash 1.8.8's method: prose 100.5, code 162.8; catalogs 79.5 / 130.7 / 154.0
     (exact build, same hour: 99.1 / 162.9; 76.3 / 125.2 / 151.2). Upstream README: 95 / 151.
+  16 users = medians of 3 runs on the live build, 2026-11-10 (distinct 367 / 375 / 368,
+    copies 441 / 428 / 436). Reproduce any row with tools/bench/bench.py.
   A lossy relaxed-accept experiment (103 / 163) was tried and removed.
 ```
 
@@ -129,6 +131,25 @@ Design, protocol and the full numbers: [docs/vision.md](ds41f-4xgx10-switchless/
 
 ## ✧ run it
 
+This is the exact build behind the numbers above (the engine source in this repo is the source of the binary we serve).
+
+```
+  1  hardware ....... 4x DGX Spark (GB10, 128 GB), ConnectX-7 links. We run TP4 through a 200G RoCE
+                      switch; upstream's switchless ring is the other supported cabling.
+  2  base setup ..... follow ds41f-4xgx10-switchless/README.md "How to use" (build, fleet file,
+                      weights, Engram shards). Build from THIS repo, not upstream:
+                        cd ds41f-4xgx10-switchless
+                        cmake -S engine -B engine/build && cmake --build engine/build -j4
+                        (cd frontend && cargo build --release -j4)
+  3  gate weights ... copy ds41f-4xgx10-switchless/tools/stack4/cfmlp_cml.bin to the SAME path on
+                      all four boxes (e.g. ~/cfmlp_cml.bin). The engine exits at start without it.
+  4  engine args .... the block below, through service.sh
+  5  images ......... optional: start tools/vision/vision_encoder.py on rank 0 and add
+                      --vision-addr 127.0.0.1:18950 to the front-end's arguments (docs/vision.md)
+  6  check .......... python3 tools/bench/bench.py http://127.0.0.1:PORT/v1/chat/completions c1 27
+                      python3 tools/bench/bench.py http://127.0.0.1:PORT/v1/chat/completions distinct 16
+```
+
 ```bash
 DSGB10_ENGINE_ARGS="--max-ctx 1048576 --slots 16 --big-slots 4 \
   --setenv DSGB10_BUDGET=1 --setenv DSGB10_OEA=4,12,9 \
@@ -139,11 +160,14 @@ DSGB10_ENGINE_ARGS="--max-ctx 1048576 --slots 16 --big-slots 4 \
   --setenv DSGB10_CERT=1"
 ```
 
-The full 4-Spark setup (switch, kernel, weights, serve, benchmarks) is in its companion repo,
-**spark-deepseek-setup**. Drop `DSGB10_OEA` for a strictly lossless multi-user build
-(details: [docs/c1fast.md](ds41f-4xgx10-switchless/docs/c1fast.md)). For images, start the encoder
-(`tools/vision/vision_encoder.py`, see [docs/vision.md](ds41f-4xgx10-switchless/docs/vision.md#running-it)) and add
-`--vision-addr 127.0.0.1:18950` to the front-end's arguments.
+What to expect on that bench with nothing else on the endpoint: chat about 80-85 and code about 140-145 for one user
+(chat runs swing between ~75 and ~95 by prompt), about 368 tok/s for 16 users with different prompts, about 436 with
+repeated prompts. The 89.5 chat figure is the mean over our 320 held-out prompts, a different and larger prompt set.
+The confidence-gate weights were fitted on this checkpoint (DeepSeek V4.1 Flash, 1017 build); on another checkpoint the
+output stays the model's own, but the gain may differ.
+
+Drop `DSGB10_OEA` for a strictly lossless multi-user build (details:
+[docs/c1fast.md](ds41f-4xgx10-switchless/docs/c1fast.md)).
 
 ## ✧ credits
 

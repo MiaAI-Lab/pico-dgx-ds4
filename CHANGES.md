@@ -85,3 +85,6 @@ confidence gate is about zero, so it is not in the engine. Numbers and code: doc
 
 Live build re-measured on our bench (27 runs, 2026-11-10, no other traffic): chat 82.7, code 142.6 (medians). README
 table and charts now show 83 / 143.
+
+Setup and bench (2026-11-10): README "run it" now lists the steps for the exact served build; tools/bench/bench.py is the
+bench behind the README numbers. 16 users re-measured on the live build: 368 distinct, 436 copies (medians of 3).
