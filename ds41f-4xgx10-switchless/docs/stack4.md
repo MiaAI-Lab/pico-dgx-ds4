@@ -125,6 +125,32 @@ either head). Plus: identity set 54/54 against the exact build, 320/320 held tex
 differences (`cert:` lines in each rank's log); `DSGB10_CERT_FORCE=N` forces the full mask every Nth step;
 `DSGB10_CERT_BSCALE=f` loosens the bound; `DSGB10_MH_DUMP=DIR` writes every step row's layer 37-39 inputs (data collection).
 
+
+## Carryover pilot: trained hidden-state version (measured offline, not in the engine)
+
+After the training-free check above, we tried the real thing from Carryover Drafting (arXiv 2609.14717) on this engine: the
+projected layer 37-39 states of the REJECTED verify rows enter the drafter's attention as one-round read-only context, marked
+by one learned embedding. We did not verify extra rows to create rejected states (a row costs about 3 ms here); only the ones
+the confidence gate already produces are used. The shipped drafter weights stay frozen. Code: `tools/stack4/carryover/`.
+
+Data: served steps on 1,942 train requests (90,636 anchors that follow a rejection); scored on 314 held requests, 12,220 such
+anchors. "Chain right through depth k" = the first k drafts all equal the served tokens.
+
+| drafter | depth 1 | depth 2 | depth 3 | accepted length (5 drafted) |
+|---|---|---|---|---|
+| shipped | .6975 | .4580 | .2985 | 1.7801 |
+| + carried states (marker, rank-64 projection, attention bias; 1,200 steps) | .7005 | .4677 | .3105 | 1.8187 (+2.17 %) |
+| + gated rank-64 adapters (2,400 steps, best checkpoint) | .7031 | .4727 | .3164 | 1.8431 (+3.54 %) |
+
+What it is worth in speed, so far: with the confidence gate's own verify counts at those anchors the first run realised
+accepted drafts +0.26 % (chat), +0.39 % (code), +0.43 % (math), about zero tok/s after a +0.05 ms pass cost. The gain sits
+mostly on the 2nd and 3rd drafts, which the gate rarely verifies. The adapter run has not been replayed with the gate, and the
+confidence MLP has not been re-fit to the carry drafter. Not built into the engine.
+
+Two things worth knowing: this is the only training that improved this drafter in any of our attempts (fine-tuning the shipped
+weights on up to 7.7 M tokens never did), and the paper's larger gains come from verifying a fixed 15 drafts a round, which
+leaves several times more rejected rows than DSpark's confidence-scheduled verify does.
+
 ## Gates for the stack (binary s4f, all three levers; exact build = same binary without the flags, same window where shown)
 
 | gate | stack | exact |

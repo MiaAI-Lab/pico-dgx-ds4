@@ -78,3 +78,7 @@ Stack vs the exact build, same binary: 320 held prompts chat +3.78 %, code +2.09
 Measured and not built: the target's output at a rejected row as the next draft (right 18 % of the time against the drafter's
 65 %), a vocabulary shortlist for the drafter's head (+0.3 % simulated on top of #13), 6-7 bit coarse codes for #15 (about
 0.07 ms), 7-bit packing of the FP8 dense weights (upstream's costing: no gain at the measured decode cost).
+
+Carryover pilot (2026-11-10, offline only): carried rejected-row states with the shipped drafter frozen raise the accepted
+length after a rejection by 2.2 % (3.5 % with small gated adapters) on 12,220 held anchors; realised speed with the current
+confidence gate is about zero, so it is not in the engine. Numbers and code: docs/stack4.md, tools/stack4/carryover/.
