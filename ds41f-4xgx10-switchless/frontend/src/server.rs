@@ -356,6 +356,7 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
         }
     }
     let mut messages = convert_messages(msgs, cfg.vision_addr.is_some())?;
+    messages.iter_mut().for_each(crate::encoding::neutralize_image_placeholder);
 
     // tools, hosted on a leading system message
     let tool_choice_none = r.get("tool_choice").and_then(Value::as_str) == Some("none");

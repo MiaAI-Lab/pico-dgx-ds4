@@ -88,3 +88,7 @@ table and charts now show 83 / 143.
 
 Setup and bench (2026-11-10): README "run it" now lists the steps for the exact served build; tools/bench/bench.py is the
 bench behind the README numbers. 16 users re-measured on the live build: 368 distinct, 436 copies (medians of 3).
+
+Front-end fix (2026-11-11): a message that contains the image placeholder as ordinary text (a doc, a log, an error quoted
+back) used to get HTTP 400 on every later turn. The placeholder is now rewritten with ASCII bars in request text and served
+as plain text; image parts are unchanged; error texts no longer quote the token. `frontend/src/encoding.rs`, `server.rs`.

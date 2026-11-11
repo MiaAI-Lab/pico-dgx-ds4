@@ -471,9 +471,7 @@ fn process_image_blocks(blocks: &[Value]) -> Result<(Vec<Value>, Vec<Value>), En
         } else if get_str(block, "type") == Some("text") {
             let text = or_empty(get(block, "text"));
             if text.contains(IMAGE_PLACEHOLDER) {
-                return Err(err(format!(
-                    "Text block contains image placeholder '{IMAGE_PLACEHOLDER}'. Images should be separate content blocks."
-                )));
+                return Err(err("Text block contains the image placeholder. Images should be separate content blocks."));
             }
             new_blocks.push(block.clone());
         } else {
@@ -483,15 +481,32 @@ fn process_image_blocks(blocks: &[Value]) -> Result<(Vec<Value>, Vec<Value>), En
     Ok((new_blocks, images))
 }
 
+/// The image placeholder typed as ordinary text (a doc, a log, an error message quoted back) is not an
+/// image slot. Rewrite it with ASCII bars in every string of a request, so it tokenises as plain text and
+/// the request is served; the reference encoder rejects such requests. Image parts are unaffected: their
+/// placeholder is inserted later, by process_image_blocks.
+pub fn neutralize_image_placeholder(v: &mut Value) {
+    match v {
+        Value::String(s) => {
+            if s.contains(IMAGE_PLACEHOLDER) {
+                *s = s.replace(IMAGE_PLACEHOLDER, "<|deepseek_image|>");
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(neutralize_image_placeholder),
+        Value::Object(o) => o.values_mut().for_each(neutralize_image_placeholder),
+        _ => {}
+    }
+}
+
 fn validate_no_image_sp_tokens(msg: &Value) -> Result<(), EncodeError> {
     if let Some(Value::String(c)) = get(msg, "content") {
         if c.contains(IMAGE_PLACEHOLDER) {
-            return Err(err(format!("Message content contains image special token '{IMAGE_PLACEHOLDER}'.")));
+            return Err(err("Message content contains the image special token."));
         }
     }
     if let Some(Value::String(c)) = get(msg, "reasoning_content") {
         if c.contains(IMAGE_PLACEHOLDER) {
-            return Err(err(format!("reasoning_content contains image special token '{IMAGE_PLACEHOLDER}'")));
+            return Err(err("reasoning_content contains the image special token"));
         }
     }
     Ok(())
