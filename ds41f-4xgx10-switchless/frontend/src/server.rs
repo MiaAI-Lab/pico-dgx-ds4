@@ -813,10 +813,13 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
     if let Err(r) = check_auth(&app, &headers) {
         return r;
     }
-    let req: Value = match serde_json::from_slice(&body) {
+    let mut req: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => return bad_request(format!("invalid JSON: {e}")),
     };
+    if let Err(e) = crate::video::expand(&mut req, app.cfg.vision_addr.as_deref()).await {
+        return if e.starts_with("cannot read") { bad_request(e) } else { error(StatusCode::SERVICE_UNAVAILABLE, "server_error", e) };
+    }
     let p = match prepare(&app.cfg, &req) {
         Ok(p) => p,
         Err(e) => return bad_request(e),
