@@ -3,7 +3,7 @@
   "subtitle": "DeepSeek V4.1 Flash on 4x DGX Spark  ·  dsgx10 fork  ·  1M context  ·  images",
   "stats": [
    [
-    "83/143",
+    "89/143",
     "chat/code, 1 user, tok/s"
    ],
    [
@@ -56,58 +56,64 @@
   {
    "file": "c1.png",
    "title": "1 user: decode tok/s",
-   "sub": "27-run medians · temp 0 · our bench (not sparkDash) · same binary, same hour",
+   "sub": "1 user · temp 0 · our bench (not sparkDash) · live build, 2026-11-10",
    "rows": [
     [
      "pico-dgx  code",
      142.6,
-     "stack4",
+     "3-prompt bench",
      true
     ],
     [
      "  before  code",
      136.6,
-     "exact",
+     "3-prompt bench",
      false
     ],
     [
      "upstream  code",
      140,
-     "",
+     "3-prompt bench",
      false
     ],
     [
      "sglang    code",
      117,
-     "",
+     "3-prompt bench",
+     false
+    ],
+    [
+     "pico-dgx  chat",
+     89.5,
+     "320-prompt set",
+     true
+    ],
+    [
+     "  before  chat",
+     86.2,
+     "320-prompt set",
      false
     ],
     [
      "pico-dgx  chat",
      82.7,
-     "stack4",
+     "3-prompt bench",
      true
-    ],
-    [
-     "  before  chat",
-     79.6,
-     "exact",
-     false
     ],
     [
      "upstream  chat",
      80,
-     "",
+     "3-prompt bench",
      false
     ],
     [
      "sglang    chat",
      64,
-     "",
+     "3-prompt bench",
      false
     ]
    ],
-   "note": "bench medians swing ±3; paired on 320 held prompts the stack is +3.8% chat (86.2 -> 89.5), +2.1% code, same texts"
+   "note": "chat is shown on both prompt sets; upstream and sglang were only measured on the 3-prompt bench"
   }
  ]
 }

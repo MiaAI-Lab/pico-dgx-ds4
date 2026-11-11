@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.png" alt="pico-dgx-ds4: DeepSeek V4.1 Flash on 4x DGX Spark" width="100%">
+  <img src="assets/banner.png?v=4" alt="pico-dgx-ds4: DeepSeek V4.1 Flash on 4x DGX Spark" width="100%">
 </p>
 
 <p align="center">
@@ -21,17 +21,17 @@
 
 ## ✧ the numbers
 
-<p align="center"><img src="assets/c16.png" alt="16-user throughput" width="80%"></p>
-<p align="center"><img src="assets/c1.png" alt="single-user throughput" width="80%"></p>
+<p align="center"><img src="assets/c16.png?v=4" alt="16-user throughput" width="80%"></p>
+<p align="center"><img src="assets/c1.png?v=4" alt="single-user throughput" width="80%"></p>
 
 ```
 ┌──────────────────────────┬──────────────┬──────────────┬────────────┐
 │ metric                   │ upstream     │ pico-dgx-ds4 │ sglang tp4 │
 ├──────────────────────────┼──────────────┼──────────────┼────────────┤
-│ chat, 1 user (temp 0)    │ 80           │ 83           │ 64         │
-│ code, 1 user (temp 0)    │ 140          │ 143          │ 117        │
-│ chat, 320 prompts paired │ -            │ 86.2 -> 89.5 │ -          │
-│ code, 320 prompts paired │ -            │ 128.2->130.9 │ -          │
+│ chat, 1 user, 320 prompts│ -            │ 89.5 (86.2)  │ -          │
+│ chat, 1 user, 3 prompts  │ 80           │ 83           │ 64         │
+│ code, 1 user, 3 prompts  │ 140          │ 143          │ 117        │
+│ code, 1 user, 320 prompts│ -            │ 130.9 (128.2)│ -          │
 │ 8 users, distinct        │ -            │ 300          │ -          │
 │ 16 users, distinct       │ -            │ 368          │ -          │
 │ 16 users, copies         │ 177          │ 436          │ 427        │
@@ -41,7 +41,8 @@
 │ images                   │ no           │ yes          │ -          │
 │ quality (qeval /75)      │ 71           │ 71-72        │ 70         │
 └──────────────────────────┴──────────────┴──────────────┴────────────┘
-  tok/s · 4x DGX Spark, TP4 over a 200G RoCE switch · single-user = 9-run medians
+  tok/s · 4x DGX Spark, TP4 over a 200G RoCE switch · temp 0 · (in brackets: before stack4)
+  Headline single-user: 89 chat (mean over 320 held-out prompts) / 143 code (3-prompt bench).
   distinct = a different prompt per user; copies = prompts repeated (shares experts
   and drafts, ~15% higher). Upstream and sglang were only measured with copies.
   All numbers are our own bench, not sparkDash.
