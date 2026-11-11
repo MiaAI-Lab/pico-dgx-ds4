@@ -639,6 +639,303 @@ void launch_z(int S, const uint8_t* xq, const uint8_t* xs, int M, const ZSegs& s
   }
 }
 
+
+// ------------------------------------------------------------------ the fixed-length code (stack5, 2026-11-11)
+// What the study costed from SASS only ("FP8: a 3-bit exponent code, with a lane fallback"), built and run.
+// An e4m3 byte is sign | 4-bit exponent | 3-bit mantissa. Per 64-byte step of 8 rows (512 bytes, a warp-step)
+// the code keeps 448 bytes: lane l's 16 bytes become a u64 of (sign << 3 | mantissa) nibbles at 8l, and 48 bits
+// of 3-bit exponent codes (a u32 at 256 + 4l, a u16 at 384 + 2l). The code of a byte is (exponent - B) mod 16
+// for the layer's window base B; its low 3 bits are the fixed part. A lane chunk with a code >= 8 is flagged
+// in the step's u32 (one bit a lane), and its 16 fourth bits are a u16 in a side list, found by a running
+// popcount. Every byte value has a code, so the decode is exact for any tensor. The steps stay in the file's
+// order, so one coding serves any grid; the side list is ordered slice by slice (the warps' k ranges), so a
+// (CTA, warp) run reads it front to back from one offset.
+struct XEnc {
+  std::vector<uint8_t> fix;    // [ntile * P][448]
+  std::vector<uint32_t> flg;   // [ntile * P]
+  std::vector<uint16_t> side;  // for slice w, for tile, for p in the slice: the flagged lanes' fourth bits
+  std::vector<uint32_t> soff;  // [wk][ntile]: where (slice, tile) starts in side
+  int B = 0;
+  uint64_t flagged = 0, chunks = 0;
+  size_t bytes() const { return fix.size() + flg.size() * 4 + side.size() * 2 + soff.size() * 4; }
+};
+
+// One word (4 bytes) of a lane: n16 its four nibbles, t its four 3-bit codes, p3n their fourth bits, bm the
+// base in every byte. The same arithmetic on the host (the encoder's check) and in the kernel.
+__host__ __device__ inline uint32_t x_word(uint32_t n16, uint32_t t, uint32_t p3n, uint32_t bm) {
+  const uint32_t x1 = (n16 | n16 << 8) & 0x00FF00FFu;
+  const uint32_t zz = (x1 | x1 << 4) & 0x0F0F0F0Fu;
+  const uint32_t sgm = (zz | zz << 4) & 0x87878787u;
+  const uint32_t y = (t | t << 10) & 0x003F003Fu;
+  const uint32_t cz = (y | y << 5) & 0x07070707u;
+  const uint32_t c4 = cz | ((p3n * 0x01020408u) & 0x08080808u);
+  return sgm | (((c4 + bm) & 0x0F0F0F0Fu) << 3);
+}
+
+XEnc x_encode(const uint8_t* W, int ntile, int K, int wk) {
+  const int P = K / 64;
+  const size_t nstep = (size_t)ntile * P;
+  XEnc e;
+  uint64_t h[16] = {};
+  for (size_t i = 0; i < nstep * 512; ++i) ++h[(W[i] >> 3) & 15];
+  uint64_t best = 0;
+  for (int b = 0; b < 16; ++b) {
+    uint64_t sum = 0;
+    for (int j = 0; j < 8; ++j) sum += h[(b + j) & 15];
+    if (sum > best) best = sum, e.B = b;
+  }
+  e.fix.assign(nstep * 448, 0);
+  e.flg.assign(nstep, 0);
+  e.soff.assign((size_t)wk * ntile, 0);
+  std::vector<uint16_t> p3all(nstep * 32);
+  for (size_t st = 0; st < nstep; ++st)
+    for (int l = 0; l < 32; ++l) {
+      const uint8_t* src = W + st * 512 + 16 * l;
+      uint64_t nib = 0, c48 = 0;
+      uint32_t p3 = 0;
+      for (int j = 0; j < 16; ++j) {
+        const uint32_t b = src[j], c4 = (((b >> 3) & 15) - e.B) & 15;
+        nib |= (uint64_t)(((b >> 7) << 3) | (b & 7)) << (4 * j);
+        c48 |= (uint64_t)(c4 & 7) << (3 * j);
+        p3 |= (c4 >> 3) << j;
+      }
+      const uint32_t clo = (uint32_t)c48;
+      const uint16_t chi = (uint16_t)(c48 >> 32);
+      std::memcpy(&e.fix[st * 448 + 8 * l], &nib, 8);
+      std::memcpy(&e.fix[st * 448 + 256 + 4 * l], &clo, 4);
+      std::memcpy(&e.fix[st * 448 + 384 + 2 * l], &chi, 2);
+      if (p3) e.flg[st] |= 1u << l, ++e.flagged;
+      p3all[st * 32 + l] = (uint16_t)p3;
+      ++e.chunks;
+    }
+  for (int w = 0; w < wk; ++w) {
+    const int p0 = P * w / wk, p1 = P * (w + 1) / wk;
+    for (int tl = 0; tl < ntile; ++tl) {
+      e.soff[(size_t)w * ntile + tl] = (uint32_t)e.side.size();
+      for (int p = p0; p < p1; ++p) {
+        const size_t st = (size_t)tl * P + p;
+        for (int l = 0; l < 32; ++l)
+          if (e.flg[st] >> l & 1) e.side.push_back(p3all[st * 32 + l]);
+      }
+    }
+  }
+  e.side.resize(e.side.size() + 64, 0);  // a predicated load never reads past the list; padding all the same
+  return e;
+}
+
+// the kernel's steps on the CPU: every byte must come back
+bool x_check(const uint8_t* W, int ntile, int K, int wk, const XEnc& e) {
+  const int P = K / 64;
+  const uint32_t bm = (uint32_t)e.B * 0x01010101u;
+  for (int w = 0; w < wk; ++w) {
+    const int p0 = P * w / wk, p1 = P * (w + 1) / wk;
+    size_t sidx = e.soff[(size_t)w * ntile];
+    for (int tl = 0; tl < ntile; ++tl) {
+      if (sidx != e.soff[(size_t)w * ntile + tl]) return false;
+      for (int p = p0; p < p1; ++p) {
+        const size_t st = (size_t)tl * P + p;
+        const uint32_t f = e.flg[st];
+        for (int l = 0; l < 32; ++l) {
+          uint64_t nib;
+          uint32_t clo;
+          uint16_t chi;
+          std::memcpy(&nib, &e.fix[st * 448 + 8 * l], 8);
+          std::memcpy(&clo, &e.fix[st * 448 + 256 + 4 * l], 4);
+          std::memcpy(&chi, &e.fix[st * 448 + 384 + 2 * l], 2);
+          const uint32_t p3 = (f >> l & 1) ? e.side[sidx + __builtin_popcount(f & ((1u << l) - 1u))] : 0u;
+          const uint64_t c48 = clo | (uint64_t)chi << 32;
+          for (int q = 0; q < 4; ++q) {
+            const uint32_t v = x_word((uint32_t)(nib >> (16 * q)) & 0xFFFFu, (uint32_t)(c48 >> (12 * q)) & 0xFFFu,
+                                      (p3 >> (4 * q)) & 0xFu, bm);
+            if (std::memcmp(&v, W + st * 512 + 16 * l + 4 * q, 4)) return false;
+          }
+        }
+        sidx += __builtin_popcount(f);
+      }
+    }
+  }
+  return true;
+}
+
+struct XW {
+  const uint8_t* fix;
+  const uint32_t* flg;
+  const uint16_t* side;
+  const uint32_t* soff;
+  uint32_t bm;
+};
+
+__device__ __forceinline__ uint32_t ldg_stream16(const void* p) {
+  uint32_t r;
+  asm volatile("ld.global.nc.L1::no_allocate.u16 %0, [%1];" : "=r"(r) : "l"(p));
+  return r;
+}
+__device__ __forceinline__ uint32_t ldg_stream16_if(uint32_t c, const void* p) {
+  uint32_t r;
+  asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %1, 0;\n mov.u32 %0, 0;\n @q ld.global.nc.L1::no_allocate.u16 %0, [%2];\n}"
+               : "=r"(r)
+               : "r"(c), "l"(p));
+  return r;
+}
+
+constexpr int kXF = 128;  // a (CTA, warp) run's flags, read into shared memory at the start: at most this many steps
+size_t x_smem(int wk, int M, int K, bool norm) {
+  return (size_t)wk * kXF * 4 + (size_t)2 * wk * 64 * sizeof(float) + (norm ? (size_t)M * (K + 32) + (size_t)M * (K / 32) : 0);
+}
+
+// k_gemv_fp8p's decomposition and arithmetic (CTA b: tiles [t0, t1); warp w: slice w of each; per tile the
+// slices' partial sums added in slice order), the weights read straight from global memory in two register
+// buffers of U steps used in turn, as k_gemv_fp8 does, and decoded in registers. The side list's addresses
+// depend on the flags, so a warp reads its whole run's flags into shared memory first (v1 requested them one
+// batch ahead, a dependent load chain: 1.2 % faster to 7.6 % slower than today's kernels).
+template <bool NORM, bool DUMP, int CPM, int U>
+__global__ void __launch_bounds__(512, CPM) k_gemv_fp8x(const uint8_t* __restrict__ xq, const uint8_t* __restrict__ xs,
+                                                         int M, ZSegs segs, int K, int ntile, dsk::NormIn nin, XW z,
+                                                         uint8_t* __restrict__ dump) {
+  using namespace dsk;
+  extern __shared__ __align__(16) uint8_t sm[];  // flags [wk][kXF] | red [2][wk][8][8] | NORM: q [M][K + 32], s [M][K/32]
+  constexpr int kXU = U;
+  const int wk = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+  const int P = K / 64, KB = K / 32, ldq = NORM ? K + 32 : K;
+  uint32_t* const sf = reinterpret_cast<uint32_t*>(sm) + warp * kXF;
+  float* const red = reinterpret_cast<float*>(sm + (size_t)wk * kXF * 4);
+  uint8_t* const sq = reinterpret_cast<uint8_t*>(red + 2 * wk * 64);
+  uint8_t* const ss = sq + (size_t)M * ldq;
+  const int p0 = (P * warp) / wk, p1 = (P * (warp + 1)) / wk;
+  const int t0 = (int)((long long)ntile * blockIdx.x / gridDim.x);
+  const int t1 = (int)((long long)ntile * (blockIdx.x + 1) / gridDim.x);
+  const uint32_t below = (1u << lane) - 1u, bit = 1u << lane;
+  uint32_t sidx = __ldg(z.soff + (size_t)warp * ntile + t0);
+  int ltl = t0, lp = p0, li = 0;
+  {
+    const int PW = p1 - p0, nrun = (t1 - t0) * PW;
+    for (int i = lane; i < nrun; i += 32) sf[i] = __ldg(z.flg + (size_t)(t0 + i / PW) * P + p0 + i % PW);
+    __syncwarp();
+  }
+  struct XB {
+    uint2 nib[kXU];
+    uint32_t clo[kXU], chi[kXU], p3[kXU];
+  };
+  XB ba, bb;
+  auto load_w = [&](XB& b) {
+#pragma unroll
+    for (int u = 0; u < kXU; ++u)
+      if (ltl < t1) {
+        const uint8_t* s = z.fix + ((size_t)ltl * P + lp) * 448;
+        const uint32_t f = sf[li++];
+        b.nib[u] = ldg_stream64(s + 8 * lane);
+        b.clo[u] = ldg_stream32(s + 256 + 4 * lane);
+        b.chi[u] = ldg_stream16(s + 384 + 2 * lane);
+        b.p3[u] = ldg_stream16_if(f & bit, z.side + sidx + __popc(f & below));
+        sidx += __popc(f);
+        if (++lp == p1) lp = p0, ++ltl;
+      }
+  };
+  load_w(ba);
+  pdl_launch_dependents();
+  pdl_wait();
+  if constexpr (NORM) {
+    const bool first = blockIdx.x == 0;
+    rmsnorm_rows(nin.x, K, nin.w, M, K, nin.eps, red, first ? nin.y : nullptr, K, sq, ldq, ss, first ? nin.q : nullptr,
+                 first ? nin.qs : nullptr);
+  }
+  __syncthreads();
+  const bool live = g < M, odd = lane & 1, lo_lane = t < 2;
+  const int off = 16 * (t & 1) + 8 * (t >> 1);
+  const uint8_t* arow = (NORM ? sq : xq) + (size_t)(live ? g : 0) * ldq + off;
+  const uint8_t* srowa = (NORM ? ss : xs) + (size_t)(live ? g : 0) * KB;
+  int ctl = t0, cp = p0, cs = 0;
+  while (cs + 1 < segs.n && 8 * t0 >= segs.row0[cs + 1]) ++cs;
+  float c[4] = {0.f, 0.f, 0.f, 0.f};
+  auto comp = [&](const XB& b) {
+#pragma unroll
+    for (int u = 0; u < kXU; ++u) {
+      if (ctl < t1) {
+        const int n = 8 * ctl - segs.row0[cs];
+        const uint8_t* const scl = segs.s[cs].S + (size_t)(n / 32) * KB;
+        const uint32_t sw = __ldg(reinterpret_cast<const uint16_t*>(scl + 2 * cp));
+        const uint64_t c48 = (uint64_t)b.clo[u] | (uint64_t)b.chi[u] << 32;
+        uint32_t v[4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+          v[q] = x_word(((q < 2 ? b.nib[u].x : b.nib[u].y) >> (16 * (q & 1))) & 0xFFFFu,
+                        (uint32_t)(c48 >> (12 * q)) & 0xFFFu, (b.p3[u] >> (4 * q)) & 0xFu, z.bm);
+        const uint4 w = make_uint4(v[0], v[1], v[2], v[3]);
+        if constexpr (DUMP)
+          *reinterpret_cast<uint4*>(dump + (size_t)(segs.row0[cs] + n) * K + (size_t)cp * 512 + 16 * lane) = w;
+        uint2 a[2];
+        uint32_t sfa[2];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const int kb = 2 * cp + h;
+          if constexpr (NORM) {
+            a[h] = live ? *reinterpret_cast<const uint2*>(arow + kb * 32) : make_uint2(0, 0);
+            sfa[h] = (odd || !live) ? 127u : srowa[kb];
+          } else {
+            a[h] = live ? __ldg(reinterpret_cast<const uint2*>(arow + kb * 32)) : make_uint2(0, 0);
+            sfa[h] = (odd || !live) ? 127u : __ldg(srowa + kb);
+          }
+        }
+        const uint32_t s0 = lo_lane ? w.z : w.x, s1 = lo_lane ? w.w : w.y;
+        const uint32_t r0 = __shfl_xor_sync(0xffffffffu, s0, 2), r1 = __shfl_xor_sync(0xffffffffu, s1, 2);
+        mma_e4m3_e4m3(c, a[0].x, 0u, a[0].y, 0u, lo_lane ? w.x : r0, lo_lane ? w.y : r1, sfa[0], sw & 0xFFu);
+        mma_e4m3_e4m3(c, a[1].x, 0u, a[1].y, 0u, lo_lane ? r0 : w.z, lo_lane ? r1 : w.w, sfa[1], (sw >> 8) & 0xFFu);
+        if (++cp == p1) {  // the tile is done: its slices' partial sums, in slice order (k_gemv_fp8p's code)
+          float* rd = red + (ctl & 1) * wk * 64;
+          rd[(warp * 8 + g) * 8 + 2 * t] = c[0];
+          rd[(warp * 8 + g) * 8 + 2 * t + 1] = c[1];
+          __syncthreads();
+          if (threadIdx.x < M * 8) {
+            const int m = threadIdx.x >> 3, r = threadIdx.x & 7;
+            float vv = 0.f;
+            for (int j = 0; j < wk; ++j) vv += rd[(j * 8 + m) * 8 + r];
+            segs.s[cs].y[(size_t)m * segs.s[cs].N + n + r] = __float2bfloat16_rn(vv);
+          }
+          c[0] = c[1] = c[2] = c[3] = 0.f;
+          cp = p0;
+          ++ctl;
+          while (cs + 1 < segs.n && 8 * ctl >= segs.row0[cs + 1]) ++cs;
+        }
+      }
+    }
+  };
+#pragma unroll 1
+  while (ctl < t1) {
+    load_w(bb);
+    comp(ba);
+    if (ctl >= t1) break;
+    load_w(ba);
+    comp(bb);
+  }
+}
+
+template <bool NORM, bool DUMP, int CPM, int U>
+void launch_x1(const uint8_t* xq, const uint8_t* xs, int M, const ZSegs& segs, int K, int wk, int ctas,
+               const dsk::NormIn& nin, const XW& z, uint8_t* dump, cudaStream_t st) {
+  static bool done = false;
+  if (!done) {
+    CUDA_CHECK(cudaFuncSetAttribute(k_gemv_fp8x<NORM, DUMP, CPM, U>, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024));
+    done = true;
+  }
+  dsk::launch_pdl(k_gemv_fp8x<NORM, DUMP, CPM, U>, dim3(ctas), dim3(32 * wk), x_smem(wk, M, K, NORM), st, true, xq, xs, M,
+                  segs, K, segs.row0[segs.n] / 8, nin, z, dump);
+}
+// cfg = 10 * (CTAs per SM) + (steps a register buffer)
+template <bool NORM>
+void launch_x(int cfg, bool dmp, const uint8_t* xq, const uint8_t* xs, int M, const ZSegs& segs, int K, int wk, int ctas,
+              const dsk::NormIn& nin, const XW& z, uint8_t* dump, cudaStream_t st) {
+  if (dmp) return launch_x1<NORM, true, 1, 2>(xq, xs, M, segs, K, wk, ctas, nin, z, dump, st);
+  switch (cfg) {
+    case 12: launch_x1<NORM, false, 1, 2>(xq, xs, M, segs, K, wk, ctas, nin, z, dump, st); break;
+    case 14: launch_x1<NORM, false, 1, 4>(xq, xs, M, segs, K, wk, ctas, nin, z, dump, st); break;
+    case 22: launch_x1<NORM, false, 2, 2>(xq, xs, M, segs, K, wk, ctas, nin, z, dump, st); break;
+    case 24: launch_x1<NORM, false, 2, 4>(xq, xs, M, segs, K, wk, ctas, nin, z, dump, st); break;
+    case 42: launch_x1<NORM, false, 4, 2>(xq, xs, M, segs, K, wk, ctas, nin, z, dump, st); break;
+    case 44: launch_x1<NORM, false, 4, 4>(xq, xs, M, segs, K, wk, ctas, nin, z, dump, st); break;
+    default: die("cfg %d", cfg);
+  }
+}
+
 // ------------------------------------------------------------------ run
 // Median time (us) per launch of fn(copy) over rotating copies, launches captured in a graph
 // (bench_kernels.cu's time_us).
@@ -863,6 +1160,112 @@ int run(const std::string& dir, std::vector<std::string> sites, std::vector<int>
                   all.c_str(), best, b.ctas[bv], bS, rawGB * 1e6 / best, zGB * 1e6 / best,
                   100 * (tt - best) / (tt - proj));
       std::fflush(stdout);
+    }
+    // ---- the fixed-length code: encode each layer (host), check the bytes and the outputs, time
+    {
+      const int ntile = std::accumulate(b.N.begin(), b.N.end(), 0) / 8;
+      struct XDev {
+        uint8_t* fix;
+        uint32_t* flg;
+        uint16_t* side;
+        uint32_t* soff;
+        uint32_t bm;
+      };
+      std::vector<XDev> xd(copies);
+      uint64_t x_all = 0, flagged = 0, chunks = 0;
+      std::vector<XEnc> xe(nl);
+      for (int i = 0; i < nl; ++i) {
+        xe[i] = x_encode(b.L[i].W.data(), ntile, K, wk);
+        if (!x_check(b.L[i].W.data(), ntile, K, wk, xe[i])) die("%s layer %d: the fixed code's CPU decode differs", name.c_str(), b.layers[i]);
+        x_all += xe[i].bytes() - 128, flagged += xe[i].flagged, chunks += xe[i].chunks;
+      }
+      for (int i = 0; i < copies; ++i) {
+        const XEnc& e = xe[i % nl];
+        xd[i] = XDev{to_dev(e.fix, 4096), to_dev(e.flg, 4096), to_dev(e.side, 4096), to_dev(e.soff, 4096),
+                     (uint32_t)e.B * 0x01010101u};
+      }
+      CUDA_CHECK(cudaDeviceSynchronize());
+      auto fx = [&](int i, int cpm, int M, std::vector<__nv_bfloat16*>& y, bool dmp, cudaStream_t s2) {
+        std::vector<dsk::Fp8Seg> sg;
+        segs_of(i, y, sg);
+        ZSegs zs{};
+        zs.n = nseg;
+        zs.row0[0] = 0;
+        for (int s = 0; s < nseg; ++s) zs.s[s] = sg[s], zs.row0[s + 1] = zs.row0[s] + b.N[s];
+        const dsk::NormIn nin{x, nw, eps, nullptr, nullptr, nullptr};
+        const XW z{xd[i].fix, xd[i].flg, xd[i].side, xd[i].soff, xd[i].bm};
+        const int ctas = std::min(ntile, (cpm / 10) * kSMs);
+        if (site->norm) launch_x<true>(cpm, dmp, nullptr, nullptr, M, zs, K, wk, ctas, nin, z, dump, s2);
+        else launch_x<false>(cpm, dmp, xq, xs, M, zs, K, wk, ctas, nin, z, dump, s2);
+      };
+      // configurations: 10 * (CTAs per SM) + (steps a buffer); a run's flags must fit in kXF
+      std::vector<int> cpms;
+      for (int c : {1, 2, 4}) {
+        if (c == 4 && 32 * wk > 256) continue;
+        const int ctas = std::min(ntile, c * kSMs), P = K / 64;
+        if (((ntile + ctas - 1) / ctas + 1) * ((P + wk - 1) / wk) > kXF) continue;
+        cpms.push_back(10 * c + 2), cpms.push_back(10 * c + 4);
+      }
+      if (cpms.empty()) die("%s: no grid whose runs fit %d steps of flags", name.c_str(), kXF);
+      for (int i = 0; i < nl; ++i) {
+        CUDA_CHECK(cudaMemsetAsync(dump, 0xFF, raw1, st));
+        fx(i, cpms[0], 1, yz, true, st);
+        CUDA_CHECK(cudaStreamSynchronize(st));
+        CUDA_CHECK(cudaMemcpy(back.data(), dump, raw1, cudaMemcpyDeviceToHost));
+        if (std::memcmp(back.data(), b.L[i].W.data(), raw1)) die("%s layer %d: the fixed code's GPU decode differs", name.c_str(), b.layers[i]);
+      }
+      int xchecked = 0;
+      for (int i = 0; i < nl; ++i)
+        for (int M = 1; M <= MM; ++M)
+          for (int cpm : cpms) {
+            if (x_smem(wk, M, K, site->norm) > 99 * 1024) continue;
+            for (int s = 0; s < nseg; ++s) {
+              CUDA_CHECK(cudaMemsetAsync(yr[s], 0x11, (size_t)MM * b.N[s] * 2, st));
+              CUDA_CHECK(cudaMemsetAsync(yz[s], 0x22, (size_t)MM * b.N[s] * 2, st));
+            }
+            today(i, M, c_today, yr, st);
+            fx(i, cpm, M, yz, false, st);
+            CUDA_CHECK(cudaStreamSynchronize(st));
+            for (int s = 0; s < nseg; ++s) {
+              std::vector<uint16_t> a((size_t)M * b.N[s]), c2((size_t)M * b.N[s]);
+              CUDA_CHECK(cudaMemcpy(a.data(), yr[s], a.size() * 2, cudaMemcpyDeviceToHost));
+              CUDA_CHECK(cudaMemcpy(c2.data(), yz[s], c2.size() * 2, cudaMemcpyDeviceToHost));
+              if (a != c2) die("%s layer %d M=%d cpm %d seg %d: the fixed code's outputs differ", name.c_str(), b.layers[i], M, cpm, s);
+            }
+            ++xchecked;
+          }
+      const double xGB = (double)x_all / nl / 1e9;
+      std::printf("FIX %s: every byte decoded exactly on %d layers (CPU and GPU); outputs identical to today's kernel in %d "
+                  "cases (1-8 rows x grids). stored %.3f MB of %.3f MB raw (%.2f %% smaller), %.1f %% of lane chunks flagged\n",
+                  name.c_str(), nl, xchecked, xGB * 1e3, rawGB * 1e3, 100 * (1 - xGB / rawGB), 100.0 * flagged / chunks);
+      std::printf("FIX %-8s %4s %9s %9s | %-56s | %8s %9s %9s %9s %8s\n", "site", "rows", "today us", "persist", "fixed us per (10 x CTAs/SM + steps a buffer)",
+                  "best us", "rawGB/s", "storedGB/s", "ms/GB raw", "vs best");
+      for (int M : rows_t) {
+        // interleaved: today, persistent, fixed, twice; the smaller of each
+        double tt = 1e30, tp = 1e30;
+        std::vector<double> tx(cpms.size(), 1e30);
+        for (int rep2 = 0; rep2 < 2; ++rep2) {
+          tt = std::min(tt, time_us(copies, [&](int i, cudaStream_t s) { today(i, M, c_today, yr, s); }));
+          tp = std::min(tp, time_us(copies, [&](int i, cudaStream_t s) { today(i, M, c_pers, yr, s); }));
+          for (size_t k = 0; k < cpms.size(); ++k) {
+            if (x_smem(wk, M, K, site->norm) > 99 * 1024) continue;
+            tx[k] = std::min(tx[k], time_us(copies, [&](int i, cudaStream_t s) { fx(i, cpms[k], M, yz, false, s); }));
+          }
+        }
+        std::string all;
+        double best = 1e30;
+        for (size_t k = 0; k < cpms.size(); ++k) {
+          char cell[32];
+          std::snprintf(cell, sizeof cell, " %d:%.2f", cpms[k], tx[k]);
+          all += cell;
+          best = std::min(best, tx[k]);
+        }
+        const double base = std::min(tt, tp);
+        std::printf("FIX %-8s %4d %9.2f %9.2f |%-57s | %8.2f %9.1f %9.1f %9.4f %+7.2f %%\n", name.c_str(), M, tt, tp, all.c_str(),
+                    best, rawGB * 1e6 / best, xGB * 1e6 / best, best / 1e3 / rawGB, 100 * (base - best) / base);
+        std::fflush(stdout);
+      }
+      for (auto& e : xd) cudaFree(e.fix), cudaFree(e.flg), cudaFree(e.side), cudaFree(e.soff);
     }
     for (auto& e : d) {
       cudaFree(e.W);

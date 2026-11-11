@@ -86,6 +86,14 @@ struct Options {
   // slower (14.4 against 18.4 GB/s at 64 MiB): relays are store-and-forward, so a post's time follows
   // its larger relayed part over two hops, not the links' loads.
   int rs_slow_pct = 50;
+  // Direct mode, for fleets where every rank reaches every other in one hop (a switch): each rank also
+  // connects to the opposite rank and writes its contribution there itself, so no proxy relays anything
+  // and the opposite rank's data takes one hop instead of two. The buffers, the six flags, the device
+  // side and the order of every sum are unchanged, so results are the same bits. Every rank must agree
+  // (checked at the bootstrap). -1: from the environment (DSGB10_RING_DIRECT=1), off if unset.
+  // 2: also send a small contribution (below split_domains_from) to each neighbour as one write and one write of
+  // both flags, instead of two halves with a flag each (the halves existed so a relay could start early).
+  int direct = -1;
 };
 
 // Proxy-side timeline of one collective, CLOCK_MONOTONIC_RAW ns on this box (0: not seen).

@@ -3,11 +3,11 @@
   "subtitle": "DeepSeek V4.1 Flash on 4x DGX Spark  ·  dsgx10 fork  ·  1M context  ·  images",
   "stats": [
    [
-    "89/143",
+    "90/144",
     "chat/code, 1 user, tok/s"
    ],
    [
-    "368",
+    "376",
     "16 users, distinct, tok/s"
    ],
    [
@@ -28,13 +28,13 @@
    "rows": [
     [
      "pico-dgx  distinct",
-     368,
+     376,
      "16 different prompts",
      true
     ],
     [
      "pico-dgx  copies",
-     436,
+     441,
      "same prompts repeated",
      true
     ],
@@ -56,7 +56,7 @@
   {
    "file": "c1.png",
    "title": "1 user: decode tok/s",
-   "sub": "1 user · temp 0 · our bench (not sparkDash) · live build, 2026-11-10",
+   "sub": "1 user · temp 0 · our bench (not sparkDash) · live build, 2026-11-11",
    "rows": [
     [
      "pico-dgx  code",

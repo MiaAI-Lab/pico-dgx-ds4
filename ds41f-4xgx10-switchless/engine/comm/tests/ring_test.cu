@@ -1089,6 +1089,7 @@ int main(int argc, char** argv) {
     else if (a == "--split-from" && i + 1 < argc) o.split_domains_from = atoi(argv[++i]);
     else if (a == "--relay-domain" && i + 1 < argc) o.relay_domain = atoi(argv[++i]);
     else if (a == "--rs-slow-pct" && i + 1 < argc) o.rs_slow_pct = atoi(argv[++i]);
+    else if (a == "--direct" && i + 1 < argc) o.direct = atoi(argv[++i]);
     else if (a == "--bulk-blocks" && i + 1 < argc) bulk_blocks = atoi(argv[++i]);
     else if (a == "--bootstrap-timeout" && i + 1 < argc) o.bootstrap_timeout_s = atoi(argv[++i]);
     else if (a == "--idle-backoff-ms" && i + 1 < argc) o.idle_backoff_ms = atoi(argv[++i]);

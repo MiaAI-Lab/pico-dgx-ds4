@@ -17,6 +17,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
@@ -385,6 +386,9 @@ struct Ring::Impl {
   HostRegion region;
   uint8_t* base = nullptr;
   Link to_next[kDomains], to_prev[kDomains];
+  Link to_opp[kDomains];  // direct mode only: straight to the opposite rank
+  bool direct = false;
+  bool merge = false;  // direct mode: a small contribution goes to a neighbour as one write and one flag pair
   int sock_next = -1, sock_prev = -1, sock_listen = -1;
   DevChannel dev{};
   unsigned long long* d_seq = nullptr;
@@ -406,6 +410,7 @@ struct Ring::Impl {
   bool post_chain(Link& l, ibv_send_wr* wrs, int n);
   int poll(Link& l);
   void post_direct(uint64_t seq, uint32_t n, uint32_t op);
+  void post_opp(uint64_t seq, uint32_t n, uint32_t op);
   void post_relay(bool to_prev, uint64_t seq, uint32_t n, uint32_t op);
   void loopback_loop();
 };
@@ -423,6 +428,12 @@ Ring::Ring(const Options& o) : impl_(new Impl) {
   Impl& I = *impl_;
   I.opt = o;
   const bool net = o.mode == Options::kRing;
+  if (net) {
+    const char* e = std::getenv("DSGB10_RING_DIRECT");
+    const int v = o.direct >= 0 ? o.direct : (e ? atoi(e) : 0);
+    I.direct = v != 0;
+    I.merge = v >= 2;
+  }
   if (net || o.rank < 0) I.F = &fleet(o.fleet);
   if (o.rank >= kRanks) die("comm: rank %d, but the ring has %d", o.rank, kRanks);
   I.rank = o.rank >= 0 ? o.rank : rank_from_hostname(o.fleet);
@@ -449,11 +460,16 @@ Ring::Ring(const Options& o) : impl_(new Impl) {
                 I.region.ptr, I.region.size, rd());
       open_link(I.to_prev[d], F.prev_dev[d].c_str(), F.gid_index, me.prev_ip[d], key + "PREV_IP" + dd, F.file,
                 I.region.ptr, I.region.size, rd());
+      // The opposite rank is reached through the next-facing device: in a switched fleet every peer is on it.
+      if (I.direct)
+        open_link(I.to_opp[d], F.next_dev[d].c_str(), F.gid_index, me.next_ip[d], key + "NEXT_IP" + dd, F.file,
+                  I.region.ptr, I.region.size, rd());
     }
     I.bootstrap();
     for (int d = 0; d < kDomains; d++) {
       connect_link(I.to_next[d], F.next_dev[d].c_str(), F.gid_index);
       connect_link(I.to_prev[d], F.prev_dev[d].c_str(), F.gid_index);
+      if (I.direct) connect_link(I.to_opp[d], F.next_dev[d].c_str(), F.gid_index);
     }
   }
   CUDA_CHECK(cudaMalloc(&I.d_seq, 2 * sizeof(unsigned long long)));
@@ -495,10 +511,11 @@ Ring::Ring(const Options& o) : impl_(new Impl) {
     else I.loopback_loop();
   });
   barrier();
-  if (o.verbose)
-    std::fprintf(stderr, "comm: rank %d (%s) up, region %zu bytes, cap %zu, mtu %d\n", I.rank,
+  if (o.verbose || I.direct)
+    std::fprintf(stderr, "comm: rank %d (%s) up, region %zu bytes, cap %zu, mtu %d%s\n", I.rank,
                  I.F ? I.F->rank[I.rank].name.c_str() : "loop", I.region.size, I.L.cap,
-                 128 << I.to_next[0].mtu);
+                 128 << I.to_next[0].mtu,
+                 I.direct ? (I.merge ? ", direct to the opposite rank (no relays), merged small writes" : ", direct to the opposite rank (no relays)") : "");
 }
 
 Ring::~Ring() {
@@ -510,6 +527,7 @@ Ring::~Ring() {
   for (int d = 0; d < kDomains; d++) {
     close_link(I.to_next[d]);
     close_link(I.to_prev[d]);
+    if (I.to_opp[d].ctx) close_link(I.to_opp[d]);
   }
   free_region(I.region);
   cudaFree(I.d_seq);
@@ -535,13 +553,14 @@ void Ring::Impl::bootstrap() {
     mine_next[d] = to_next[d].me;
     mine_prev[d] = to_prev[d].me;
   }
-  int32_t hello[2] = {rank, (int32_t)L.cap}, got_n[2], got_p[2];
+  int32_t hello[3] = {rank, (int32_t)L.cap, direct ? 1 : 0}, got_n[3], got_p[3];
   send_all(sock_next, hello, sizeof hello);
   send_all(sock_prev, hello, sizeof hello);
   recv_all(sock_next, got_n, sizeof got_n);
   recv_all(sock_prev, got_p, sizeof got_p);
   if (got_n[0] != next || got_p[0] != prev) die("comm: ring order mismatch (%d, %d)", got_n[0], got_p[0]);
   if (got_n[1] != (int32_t)L.cap || got_p[1] != (int32_t)L.cap) die("comm: ranks disagree on cap");
+  if (got_n[2] != hello[2] || got_p[2] != hello[2]) die("comm: ranks disagree on direct mode (DSGB10_RING_DIRECT)");
   send_all(sock_next, mine_next, sizeof mine_next);
   send_all(sock_prev, mine_prev, sizeof mine_prev);
   recv_all(sock_next, theirs_next, sizeof theirs_next);
@@ -549,6 +568,17 @@ void Ring::Impl::bootstrap() {
   for (int d = 0; d < kDomains; d++) {
     to_next[d].peer = theirs_next[d];
     to_prev[d].peer = theirs_prev[d];
+  }
+  if (direct) {
+    // The opposite rank's queue pairs, passed two steps along the ring: each rank sends its own to next,
+    // then forwards what prev sent; the second thing prev sends is the opposite rank's.
+    PeerInfo mine_opp[kDomains], hop1[kDomains], hop2[kDomains];
+    for (int d = 0; d < kDomains; d++) mine_opp[d] = to_opp[d].me;
+    send_all(sock_next, mine_opp, sizeof mine_opp);
+    recv_all(sock_prev, hop1, sizeof hop1);
+    send_all(sock_next, hop1, sizeof hop1);
+    recv_all(sock_prev, hop2, sizeof hop2);
+    for (int d = 0; d < kDomains; d++) to_opp[d].peer = hop2[d];
   }
 }
 
@@ -688,6 +718,29 @@ struct Chain {
     w.wr.rdma.rkey = l.peer.rkey;
     n++;
   }
+  // Two flags that are neighbours in the region (remote_off is the first), in one inline write of the first
+  // flag's line and the second's {seq, nbytes, op}.
+  void set_flag_pair(const Link& l, uint64_t seq, uint32_t nbytes, uint32_t op, uint64_t remote_off) {
+    for (int k = 0; k < 2; k++) {
+      memset(&flag[k], 0, sizeof(Flag));
+      flag[k].seq = seq;
+      flag[k].nbytes = nbytes;
+      flag[k].op = op;
+    }
+    ibv_send_wr& w = wr[n];
+    ibv_sge& s = sg[n];
+    w = ibv_send_wr{};
+    s.addr = (uint64_t)&flag[0];
+    s.length = sizeof(Flag) + 16;
+    s.lkey = 0;
+    w.opcode = IBV_WR_RDMA_WRITE;
+    w.sg_list = &s;
+    w.num_sge = 1;
+    w.send_flags = IBV_SEND_INLINE;
+    w.wr.rdma.remote_addr = l.peer.base + remote_off;
+    w.wr.rdma.rkey = l.peer.rkey;
+    n++;
+  }
 };
 }  // namespace
 
@@ -710,7 +763,18 @@ void Ring::Impl::post_direct(uint64_t seq, uint32_t n, uint32_t op) {
   for (Side& sd : sides) {
     Seg a, b;
     direct_segs(op, rank, sd.to_next, n, opt.rs_slow_pct, a, b);
-    if (!split) {
+    // Direct mode: nobody relays. An all-exchange still sends each neighbour all of it (A and B); a
+    // reduce-scatter sends a neighbour only its own quarter (B), with A's flag for the waiters.
+    if (direct && op == kOpReduceScatter) a.len = 0;
+    static_assert(kFromPrevB == kFromPrevA + 1 && kFromNextB == kFromNextA + 1, "the A and B flags must be neighbours");
+    if (direct && merge && !split) {
+      // nobody relays, so A need not go first: the neighbour's bytes in one write, both flags in one
+      Chain c;
+      if (op == kOpReduceScatter) c.write(*sd.l[0], mine + b.off, b.len, sd.buf + b.off);
+      else c.write(*sd.l[0], mine, n, sd.buf);
+      c.set_flag_pair(*sd.l[0], seq, n, op, sd.fa);
+      post_chain(*sd.l[0], c.wr, c.n);
+    } else if (!split) {
       Chain c;
       c.write(*sd.l[0], mine + a.off, a.len, sd.buf + a.off);
       c.set_flag(*sd.l[0], 0, seq, n, op, sd.fa);
@@ -727,7 +791,39 @@ void Ring::Impl::post_direct(uint64_t seq, uint32_t n, uint32_t op) {
       post_chain(*sd.l[1], cb.wr, cb.n);
     }
   }
+  if (direct) post_opp(seq, n, op);
   st.posted++;
+}
+
+// Direct mode: this rank's contribution (reduce-scatter: the opposite rank's quarter) straight into the
+// opposite rank's opp buffer, at the offsets the relays would have used, then the two flags the relays
+// would have set. Small ones go as one write on opt.relay_domain, so the two NIC functions share the
+// three peers; large ones as two halves on the two domains, like the neighbours' parts.
+void Ring::Impl::post_opp(uint64_t seq, uint32_t n, uint32_t op) {
+  const int p = seq % kSlots;
+  const uint8_t* mine = base + L.send[p];
+  uint32_t off = 0, len = n;
+  if (op == kOpReduceScatter) {
+    len = n / 4;
+    off = (rank + 2) % kRanks * len;
+  }
+  static_assert(kOpp1 == kOpp0 + 1, "the opp flags must be neighbours");
+  if (n < opt.split_domains_from) {
+    Link& l = to_opp[opt.relay_domain];
+    Chain c;
+    c.write(l, mine + off, len, L.opp[p] + off);
+    c.set_flag_pair(l, seq, n, op, L.flag(p, kOpp0));
+    post_chain(l, c.wr, c.n);
+  } else {
+    const uint32_t h = split_at(len);
+    Chain c0, c1;
+    c0.write(to_opp[0], mine + off, h, L.opp[p] + off);
+    c0.set_flag(to_opp[0], 0, seq, n, op, L.flag(p, kOpp0));
+    c1.write(to_opp[1], mine + off + h, len - h, L.opp[p] + off + h);
+    c1.set_flag(to_opp[1], 0, seq, n, op, L.flag(p, kOpp1));
+    post_chain(to_opp[0], c0.wr, c0.n);
+    post_chain(to_opp[1], c1.wr, c1.n);
+  }
 }
 
 // Forward a neighbour's part A to the other neighbour, for whom it comes from the opposite rank:
@@ -793,7 +889,7 @@ void Ring::Impl::proxy_loop() {
         worked = true;
       }
     }
-    {
+    if (!direct) {
       Flag* f = flag(next_relay_prev % kSlots, kFromNextA);
       if (load_acquire(&f->seq) == next_relay_prev) {
         if (done_relay_next + 1 >= next_relay_prev) {
@@ -808,7 +904,7 @@ void Ring::Impl::proxy_loop() {
         }
       }
     }
-    {
+    if (!direct) {
       Flag* f = flag(next_relay_next % kSlots, kFromPrevA);
       if (load_acquire(&f->seq) == next_relay_next) {
         if (done_relay_prev + 1 >= next_relay_next) {
@@ -826,6 +922,7 @@ void Ring::Impl::proxy_loop() {
     for (int d = 0; d < kDomains; d++) {
       if (poll(to_next[d])) worked = true;
       if (poll(to_prev[d])) worked = true;
+      if (direct && poll(to_opp[d])) worked = true;
     }
     if (backoff_ns && ++rounds == 1024) {
       rounds = 0;

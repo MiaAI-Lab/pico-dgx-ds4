@@ -27,3 +27,7 @@ add_executable(bench_pattn tests/bench_pattn.cu)
 target_link_libraries(bench_pattn dsk_kernels dsattn)
 add_executable(bench_chain tests/bench_chain.cu)
 target_link_libraries(bench_chain dsk_kernels dsattn)
+
+# lossless weight compression benches (docs/engine.md; stack5.md): bench only
+add_executable(bench_wcomp tests/bench_wcomp.cu)
+target_link_libraries(bench_wcomp dsk_kernels)

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.png?v=4" alt="pico-dgx-ds4: DeepSeek V4.1 Flash on 4x DGX Spark" width="100%">
+  <img src="assets/banner.png?v=5" alt="pico-dgx-ds4: DeepSeek V4.1 Flash on 4x DGX Spark" width="100%">
 </p>
 
 <p align="center">
@@ -21,39 +21,41 @@
 
 ## ✧ the numbers
 
-<p align="center"><img src="assets/c16.png?v=4" alt="16-user throughput" width="80%"></p>
-<p align="center"><img src="assets/c1.png?v=4" alt="single-user throughput" width="80%"></p>
+<p align="center"><img src="assets/c16.png?v=5" alt="16-user throughput" width="80%"></p>
+<p align="center"><img src="assets/c1.png?v=5" alt="single-user throughput" width="80%"></p>
 
 ```
 ┌──────────────────────────┬──────────────┬──────────────┬────────────┐
 │ metric                   │ upstream     │ pico-dgx-ds4 │ sglang tp4 │
 ├──────────────────────────┼──────────────┼──────────────┼────────────┤
-│ chat, 1 user, 320 prompts│ -            │ 89.5 (86.2)  │ -          │
-│ chat, 1 user, 3 prompts  │ 80           │ 83           │ 64         │
-│ code, 1 user, 3 prompts  │ 140          │ 143          │ 117        │
-│ code, 1 user, 320 prompts│ -            │ 130.9 (128.2)│ -          │
-│ 8 users, distinct        │ -            │ 300          │ -          │
-│ 16 users, distinct       │ -            │ 368          │ -          │
-│ 16 users, copies         │ 177          │ 436          │ 427        │
-│ agents (8 x 80-300K ctx) │ ~150         │ 260-266      │ -          │
+│ chat, 1 user, 320 prompts│ -            │ 90.3 (86.2)  │ -          │
+│ chat, 1 user, 3 prompts  │ 80           │ 85           │ 64         │
+│ code, 1 user, 3 prompts  │ 140          │ 144          │ 117        │
+│ code, 1 user, 320 prompts│ -            │ 133.6 (128.2)│ -          │
+│ 8 users, distinct        │ -            │ 307          │ -          │
+│ 16 users, distinct       │ -            │ 376          │ -          │
+│ 16 users, copies         │ 177          │ 441          │ 427        │
+│ agents (8 x 80-300K ctx) │ ~150         │ 260-270      │ -          │
 │ prefill                  │ 10k          │ 10k          │ 5.3k       │
 │ max context              │ 256K         │ 1M           │ 1M         │
 │ images                   │ no           │ yes          │ -          │
 │ quality (qeval /75)      │ 71           │ 71-72        │ 70         │
 └──────────────────────────┴──────────────┴──────────────┴────────────┘
-  tok/s · 4x DGX Spark, TP4 over a 200G RoCE switch · temp 0 · (in brackets: before stack4)
-  Headline single-user: 89 chat (mean over 320 held-out prompts) / 143 code (3-prompt bench).
+  tok/s · 4x DGX Spark, TP4 over a 200G RoCE switch · temp 0 · (in brackets: before stack4 + stack5)
+  Headline single-user: 90 chat (mean over 320 held-out prompts) / 144 code (3-prompt bench).
   distinct = a different prompt per user; copies = prompts repeated (shares experts
   and drafts, ~15% higher). Upstream and sglang were only measured with copies.
   All numbers are our own bench, not sparkDash.
-  Single-user = 27-run medians of our bench on the live build, 2026-11-10: 82.7 / 142.6
-    (an earlier 27-run the same day read 80.1 / 142.4, with the exact build at 79.6 / 136.6 in
-    that hour; the medians swing by ±3 between runs). The paired rows are the proof:
-    the same 320 held-out prompts, before -> after the stack4 levers, same texts.
-  On sparkDash 1.8.8's method: prose 100.5, code 162.8; catalogs 79.5 / 130.7 / 154.0
-    (exact build, same hour: 99.1 / 162.9; 76.3 / 125.2 / 151.2). Upstream README: 95 / 151.
-  16 users = medians of 3 runs on the live build, 2026-11-10 (distinct 367 / 375 / 368,
-    copies 441 / 428 / 436). Reproduce any row with tools/bench/bench.py.
+  Single-user = 27-run medians of our bench on the live build, 2026-11-11: 84.6 / 144.0
+    (2026-11-10, before stack5: 82.7 / 142.6; the medians swing by ±3 between runs). The
+    paired rows are the proof: the same 320 held-out prompts, same texts: chat 86.2 exact
+    build -> 89.5 with stack4 -> 90.3 with stack5 (89.2 without it, same binary, same hour).
+  On sparkDash 1.8.8's method (live build, 2026-11-11): prose 102.0, code 164.6; catalogs
+    80.7 / 132.4 / 156.0 (before stack5, same binary, same hour: 100.6 / 163.0;
+    78.8 / 128.8 / 154.1). Upstream README: 95 / 151.
+  16 users = medians of 3 runs on the live build, 2026-11-11 (distinct 374 / 376 / 378,
+    copies 441 / 448 / 439). 8 users and agents: gate runs on a test port, same build.
+    Reproduce the bench rows with tools/bench/bench.py.
   A lossy relaxed-accept experiment (103 / 163) was tried and removed.
 ```
 
@@ -73,11 +75,22 @@
   4-bit draft head ... --draft-head4 --draft-markov8 + DSGB10_HEAD4_C1=1 (one-user drafts only)
   learned gate ....... DSGB10_CF_MLP=FILE, a small MLP decides how many drafts a step verifies
   certified head ..... DSGB10_CERT=1, greedy steps read a coarse head + only the rows that can win
+  direct ring ........ DSGB10_RING_DIRECT=2, on a switch each rank writes to every rank itself (no relays)
   (removed) relaxed accept: lossy single-user experiment, not part of the build (CHANGES.md #12)
 ```
 
 Per-commit details and measured before/after numbers are in [CHANGES.md](CHANGES.md); the design is in
 [docs/wide64.md](ds41f-4xgx10-switchless/docs/wide64.md).
+
+## ✧ stack5: sync without relays
+
+Upstream's collectives were built for a cabled ring: each box sends to its two neighbours and they relay to the box
+opposite. On a switch that second hop is not needed. With `DSGB10_RING_DIRECT=2` every box writes to all three others
+itself; buffers, flags and the order of every sum stay the same, so the results are the same bits. A 10 KB all-reduce went
+14.5 -> 9.9 us, the engine's step 0.2-0.6 ms shorter: chat +1.3 %, code +1.8 %, math +1.8 % on the 320 held-out prompts,
+same texts; 16 users with different prompts 364 -> 373 in the same window (live medians 368 -> 376). Two other levers were measured and not built: losslessly coded FP8 weights decoded inside
+the GEMV (about par with today's kernels, Huffman slower) and a 4-bit drafter body (the lost drafts cancel the shorter
+pass). The 100 tok/s chat target was not reached. Details: [docs/stack5.md](ds41f-4xgx10-switchless/docs/stack5.md).
 
 ## ✧ stack4: three small single-user levers
 
@@ -158,12 +171,14 @@ DSGB10_ENGINE_ARGS="--max-ctx 1048576 --slots 16 --big-slots 4 \
   --setenv DSGB10_WIDE_COST=24,2.2,57,1.1 \
   --draft-head4 --draft-markov8 --setenv DSGB10_HEAD4_C1=1 \
   --setenv DSGB10_CF_MLP=~/cfmlp_cml.bin --setenv DSGB10_CF_ALPHA=1.0 \
-  --setenv DSGB10_CERT=1"
+  --setenv DSGB10_CERT=1 --setenv DSGB10_RING_DIRECT=2"
+# DSGB10_RING_DIRECT=2 only when all four boxes are on one switch (every rank reaches every
+# rank in one hop). On upstream's cabled ring leave it out.
 ```
 
 What to expect on that bench with nothing else on the endpoint: chat about 80-85 and code about 140-145 for one user
-(chat runs swing between ~75 and ~95 by prompt), about 368 tok/s for 16 users with different prompts, about 436 with
-repeated prompts. The 89.5 chat figure is the mean over our 320 held-out prompts, a different and larger prompt set.
+(chat runs swing between ~75 and ~95 by prompt), about 376 tok/s for 16 users with different prompts, about 441 with
+repeated prompts. The 90.3 chat figure is the mean over our 320 held-out prompts, a different and larger prompt set.
 The confidence-gate weights were fitted on this checkpoint (DeepSeek V4.1 Flash, 1017 build); on another checkpoint the
 output stays the model's own, but the gain may differ.
 

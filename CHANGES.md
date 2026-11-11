@@ -92,3 +92,29 @@ bench behind the README numbers. 16 users re-measured on the live build: 368 dis
 Front-end fix (2026-11-11): a message that contains the image placeholder as ordinary text (a doc, a log, an error quoted
 back) used to get HTTP 400 on every later turn. The placeholder is now rewritten with ASCII bars in request text and served
 as plain text; image parts are unchanged; error texts no longer quote the token. `frontend/src/encoding.rs`, `server.rs`.
+
+## stack5: sync without relays; coded weights and a 4-bit drafter body measured, not built (2026-11-11)
+
+Three levers got a decisive measurement before any engine work; one shipped. Design, proofs and the two negative results:
+[docs/stack5.md](ds41f-4xgx10-switchless/docs/stack5.md).
+
+| # | Change | Files | Default | Same output | Before -> after |
+|---|---|---|---|---|---|
+| 16 | Direct ring `DSGB10_RING_DIRECT=1\|2` (`comm::Options::direct`, `ring_test --direct`) for fleets where every rank reaches every other in one hop (a switch): each rank also connects to the opposite rank and writes its contribution there itself; proxies relay nothing. Mode 2 also sends a small contribution to a neighbour as one write and one write of both flags. Buffers, flags, device kernels and the order of every sum are unchanged | `engine/comm/{ring.cpp,ring.h}`, `engine/comm/tests/ring_test.cu` | off | yes: same bits; 54/54 identity prompts, 320/320 held texts, identical steps | 10 KB all-reduce 14.45 -> 9.89 us, a step's 80 all-reduces 1.16 -> 0.79 ms (ring bench); engine GPU step -0.21 ms at one row .. -0.59 ms at six; 320 prompts chat 89.16 -> 90.28, code 131.32 -> 133.62, math 136.99 -> 139.46 |
+| - | Bench only: a fixed-length lossless FP8 weight code decoded inside the GEMV (`k_gemv_fp8x`), next to upstream's fused Huffman kernel; `bench_wcomp` is now a CMake target | `engine/kernels/tests/bench_wcomp.cu`, `engine/kernels/CMakeLists.txt` | - | bit-exact (bench) | no gain: see below |
+
+Gates with #16 on (test port; relay ring in the same window or stack4's gate run in brackets): 16 distinct 372.5, 373.9
+(367.3, 361.6); copies 458.7 (439.1); 8 distinct 307.4 (302); agent 269.5 (262.4); our bench 27-run 82.4 / 143.7
+(81.5 / 145.3: within its noise); sparkDash c1 prose 101.9-102.3 (100.3-100.9), code 159.9-165.3 (162.5-163.4), catalogs
+80.7 / 132.4 / 156.1 (78.8 / 128.8 / 154.1); prefill 9.0k / 10.2k; qeval 71 / 71; needle 3/3 at 948K; images 15/15.
+
+Measured and not built:
+- Lossless coding of the dense FP8 weights, decoded inside the GEMV, on one Spark with our weights. Fused Huffman (upstream's
+  kernel, 17 % fewer bytes): 10-48 % slower than today's kernels, as upstream found. A fixed-length 7-bit code with a
+  side list for outliers (8.3-8.8 % fewer bytes, every byte exact, outputs bit-identical): -6 % to +6 % against today's
+  kernels by site and row count, about par on average; it reads its stored bytes at 216-237 GB/s against 248-258 GB/s raw.
+  The bar was 3 % of the dense time.
+- The drafter's FP8 body as MXFP4, post hoc, in the torch mirror: accepted length -1.9 % chat, -1.3 % code, -1.4 % math for a
+  pass that would be 0.30 ms shorter; first-order simulated gain 0 to +0.2 %. A quantisation-aware fine-tune was not run.
+
+The chat target of 100 tok/s on the 320 held prompts was not reached: 90.3.
